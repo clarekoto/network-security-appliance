@@ -4,6 +4,7 @@ import sys
 import struct
 import random
 import ipaddress
+from socket import inet_aton
 from scapy.all import sniff, Ether, IP, TCP, UDP, ICMP, raw
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, Optional, List, Any
@@ -13,11 +14,11 @@ from support import *
 # where each part in a packet starts
 HEADER = {"first_byte": (0, 8), "dest_mac": (8, 48), "src_mac": (56, 48), "protocol": (120, 8), "src_ip": (128, 32), "dest_ip": (160, 32)}
 # HEADER_SIZES = {"first_byte": 8, "dest_mac": 48, "src_mac": 48, "protocol": 8, "src_ip": 32, "dest_ip": 32}
-TCP = {"src_port": (192, 16), "dest_port": (208, 16), "sequence": (224, 32), "ack": (256, 32), "flag": (288, 8), "payload": 296}
+TCP_HDR = {"src_port": (192, 16), "dest_port": (208, 16), "sequence": (224, 32), "ack": (256, 32), "flag": (288, 8), "payload": 296}
 # TCP_SIZE = {"src_port": 16, "dest_port": 16, "sequence": 32, "ack": 32, "flag": 8}
-UDP = {"src_port": (192, 16), "dest_port": (208, 16), "payload": 224}
+UDP_HDR = {"src_port": (192, 16), "dest_port": (208, 16), "payload": 224}
 # UDP_SIZE = {"src_port": 16, "dest_port": 16}
-ICMP = {"type": (192, 8), "code": (200, 8), "header": (208, 32), "payload": 240}
+ICMP_HDR = {"type": (192, 8), "code": (200, 8), "header": (208, 32), "payload": 240}
 # ICMP_SIZE = {"type": }
 FLAG_MASKS = {"CWR": 0b10000000, "ECE": 0b01000000, "URG": 0b00100000, "ACK": 0b00010000, "PSH": 0b00001000, "RST": 0b00000100, "SYN": 0b00000010, "FIN": 0b00000001}
 STR_MACS = {"mgt": "28ee5285f23a", "int": "28ee52e2b730", "dmz": "28ee524c4d70", "ext": "28ee529c61ab"}
@@ -83,7 +84,7 @@ class InterfaceHandler:
         self.ext = Interface("ext", "28:ee:52:9c:61:ab", "255.255.255.0", "130.102.184.1")
         self.IFACE_NETWORKS = {"192.168.96.0": "mgt", "10.0.0.0": "int", "10.1.0.0": "dmz", "130.102.184.0": "ext"}
 
-    def scapy_to_custom_format(self, scapy_pkt, ingress="ext"):
+    def scapy_to_format(self, scapy_pkt, ingress="ext"):
         import struct
 
         # only handle IP packets
@@ -116,7 +117,6 @@ class InterfaceHandler:
         # build common header
         header = (interface_bytes[ingress] + dst_mac + src_mac +
                 "0800" + proto_hex + src_ip + dst_ip)
-
         # add protocol specific fields
         if TCP in scapy_pkt:
             src_port = format(scapy_pkt[TCP].sport, '04x')
@@ -309,8 +309,8 @@ class PacketEngine:
         dest_ip = self.read_packet(packet, HEADER["src_ip"][0], HEADER["src_ip"][1])
         type = "00"
         code = "00"
-        header = self.read_packet(packet, ICMP["header"][0], ICMP["header"][1])
-        payload = self.read_packet(packet, ICMP["payload"], len(packet)*4 - ICMP["payload"])
+        header = self.read_packet(packet, ICMP_HDR["header"][0], ICMP_HDR["header"][1])
+        payload = self.read_packet(packet, ICMP_HDR["payload"], len(packet)*4 - ICMP_HDR["payload"])
         
         return first_byte + dest_mac + src_mac + ethertype + proto + src_ip + dest_ip + type + code + header + payload
 
@@ -332,29 +332,29 @@ class PacketEngine:
         
         # protocol 1 == ICMP 6 == TCP, 17 == UDP
         if packet_info["protocol"] == "01":
-            packet_info["type"] = self.str_hex_to_binary(self.read_packet(packet, ICMP["type"][0], ICMP["type"][1]))
-            packet_info["code"] = self.str_hex_to_binary(self.read_packet(packet, ICMP["code"][0], ICMP["code"][1]))
-            packet_info["header"] = self.read_packet(packet, ICMP["header"][0], ICMP["header"][1])
-            packet_info["payload"] = self.read_packet(packet, ICMP["payload"], len(packet)*4 - ICMP["payload"])
+            packet_info["type"] = self.str_hex_to_binary(self.read_packet(packet, ICMP_HDR["type"][0], ICMP_HDR["type"][1]))
+            packet_info["code"] = self.str_hex_to_binary(self.read_packet(packet, ICMP_HDR["code"][0], ICMP_HDR["code"][1]))
+            packet_info["header"] = self.read_packet(packet, ICMP_HDR["header"][0], ICMP_HDR["header"][1])
+            packet_info["payload"] = self.read_packet(packet, ICMP_HDR["payload"], len(packet)*4 - ICMP_HDR["payload"])
             packet_info["bytes"] = len(packet) / 2
             
         if packet_info["protocol"] == "06" or packet_info["protocol"] == "11":
-            packet_info["src_port"] = self.read_packet(packet, TCP["src_port"][0], TCP["src_port"][1])
-            packet_info["dest_port"] = self.read_packet(packet, TCP["dest_port"][0], TCP["dest_port"][1])
+            packet_info["src_port"] = self.read_packet(packet, TCP_HDR["src_port"][0], TCP_HDR["src_port"][1])
+            packet_info["dest_port"] = self.read_packet(packet, TCP_HDR["dest_port"][0], TCP_HDR["dest_port"][1])
         
         if packet_info["protocol"] == "06":
-            flags_int = int(self.read_packet(packet, TCP["flag"][0], TCP["flag"][1]), 16)
+            flags_int = int(self.read_packet(packet, TCP_HDR["flag"][0], TCP_HDR["flag"][1]), 16)
             flags_int &= ~(FLAG_MASKS["URG"] | FLAG_MASKS["PSH"])
-            packet_info["seq"] = self.read_packet(packet, TCP["sequence"][0], TCP["sequence"][1])
-            packet_info["ack"] = self.read_packet(packet, TCP["ack"][0], TCP["ack"][1])
+            packet_info["seq"] = self.read_packet(packet, TCP_HDR["sequence"][0], TCP_HDR["sequence"][1])
+            packet_info["ack"] = self.read_packet(packet, TCP_HDR["ack"][0], TCP_HDR["ack"][1])
             packet_info["flags"] = self.int_to_hex_str(flags_int, 2)
-            packet_info["payload"] = self.read_packet(packet, TCP["payload"], len(packet)*4 - TCP["payload"])
+            packet_info["payload"] = self.read_packet(packet, TCP_HDR["payload"], len(packet)*4 - TCP_HDR["payload"])
         
         if packet_info["protocol"] == "11":
             packet_info["seq"] = ""
             packet_info["ack"] = ""
             packet_info["flags"] = ""
-            packet_info["payload"] = self.read_packet(packet, UDP["payload"], len(packet)*4 - UDP["payload"])
+            packet_info["payload"] = self.read_packet(packet, UDP_HDR["payload"], len(packet)*4 - UDP_HDR["payload"])
 
         return packet_info
 
@@ -802,16 +802,16 @@ interface for sending."""
             print(f"Destination IP: {dst_ip}")
 
             if proto == 1:  # ICMP
-                icmp_type = self.str_hex_to_binary(self.read_packet(packet, ICMP['type'][0], ICMP['type'][1]))
-                icmp_code = self.str_hex_to_binary(self.read_packet(packet, ICMP['code'][0], ICMP['code'][1]))
+                icmp_type = self.str_hex_to_binary(self.read_packet(packet, ICMP_HDR['type'][0], ICMP_HDR['type'][1]))
+                icmp_code = self.str_hex_to_binary(self.read_packet(packet, ICMP_HDR['code'][0], ICMP_HDR['code'][1]))
                 print(f"ICMP -> Type: {icmp_type}, Code: {icmp_code}")
 
             elif proto == 6:  # TCP
-                src_port = self.str_hex_to_binary(self.read_packet(packet, TCP['src_port'][0], TCP['src_port'][1]))
-                dst_port = self.str_hex_to_binary(self.read_packet(packet, TCP['dest_port'][0], TCP['dest_port'][1]))
-                seq = self.str_hex_to_binary(self.read_packet(packet, TCP['sequence'][0], TCP['sequence'][1]))
-                ack = self.str_hex_to_binary(self.read_packet(packet, TCP['ack'][0], TCP['ack'][1]))
-                flags = self.str_hex_to_binary(self.read_packet(packet, TCP['flag'][0], TCP['flag'][1]))
+                src_port = self.str_hex_to_binary(self.read_packet(packet, TCP_HDR['src_port'][0], TCP_HDR['src_port'][1]))
+                dst_port = self.str_hex_to_binary(self.read_packet(packet, TCP_HDR['dest_port'][0], TCP_HDR['dest_port'][1]))
+                seq = self.str_hex_to_binary(self.read_packet(packet, TCP_HDR['sequence'][0], TCP_HDR['sequence'][1]))
+                ack = self.str_hex_to_binary(self.read_packet(packet, TCP_HDR['ack'][0], TCP_HDR['ack'][1]))
+                flags = self.str_hex_to_binary(self.read_packet(packet, TCP_HDR['flag'][0], TCP_HDR['flag'][1]))
 
                 flag_names = [name for name, mask in FLAG_MASKS.items() if flags & mask]
 
@@ -820,8 +820,8 @@ interface for sending."""
                 print(f"Flags: {flag_names if flag_names else 'None'}")
 
             elif proto == 17:  # UDP
-                src_port = self.str_hex_to_binary(self.read_packet(packet, UDP['src_port'][0], UDP['src_port'][1]))
-                dst_port = self.str_hex_to_binary(self.read_packet(packet, UDP['dest_port'][0], UDP['dest_port'][1]))
+                src_port = self.str_hex_to_binary(self.read_packet(packet, UDP_HDR['src_port'][0], UDP_HDR['src_port'][1]))
+                dst_port = self.str_hex_to_binary(self.read_packet(packet, UDP_HDR['dest_port'][0], UDP_HDR['dest_port'][1]))
                 print(f"UDP -> Src Port: {src_port}, Dst Port: {dst_port}")
 
             print("============================\n")
@@ -897,7 +897,6 @@ def run_appliance(cap_file) -> None:
         def handle(pkt):
             try:
                 iface = pkt.sniffed_on
-                print(iface)
                 logical_iface = INTERFACE_MAP.get(iface, "ext") # if iface is unknown its treated as external
                 hex_packet = ih.scapy_to_format(pkt)
                 if hex_packet:
@@ -905,7 +904,7 @@ def run_appliance(cap_file) -> None:
             except Exception as e:
                 print(f"Error processing packet: {e}")
     
-        sniff( prn=handle, store=False)
+        sniff( prn=handle, store=False, filter="not port 22")
     else: 
         while True:
             raw = ih.next_packet()
