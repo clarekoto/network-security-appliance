@@ -4,6 +4,7 @@ import sys
 import struct
 import random
 import ipaddress
+from scapy.all import sniff, Ether, IP, TCP, UDP, ICMP, raw
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, Optional, List, Any
 from support import *
@@ -22,6 +23,13 @@ FLAG_MASKS = {"CWR": 0b10000000, "ECE": 0b01000000, "URG": 0b00100000, "ACK": 0b
 # Define your classes and functions here
 STR_MACS = {"mgt": "28ee5285f23a", "int": "28ee52e2b730", "dmz": "28ee524c4d70", "ext": "28ee529c61ab"}
 STR_IPS = {"ext": "8266b801" }
+
+
+def scapy_to_hex(pkt):
+    # convert the raw packet bytes to hex string
+    # this is the same format your spcap file uses
+    raw_bytes = bytes(pkt)
+    return raw_bytes.hex()
 
 class Interface:
     # have name as a variable so i can run send_packet
@@ -82,6 +90,11 @@ class InterfaceHandler:
             if data[len(data) - 1] == '\n':
                 data = data[0: len(data) - 1]
             return data
+    
+    def live_capture(self, interface, packet_engine):
+        print(f"Listening on {interface}")
+
+
         
         """to “send out” packets via the appropriate
     interfaces (referenced by the 3-character string mgt/int/dmz/ext) send_packet method"""    
@@ -822,14 +835,22 @@ tion address and port, the connection state (“new”, “syn_sent”, “estab
 # DO NOT MODIFY the run_appliance definition IN ANY WAY
 # It MUST work as run_appliance("filename.spcap") as defined here
 
-def run_appliance(cap_file: str = "traffic.spcap") -> None:
-    ih = InterfaceHandler(cap_file)
-    pe = PacketEngine(ih)
-    while True:
-        raw = ih.next_packet()
-        if raw is None:
-            break
-        pe.process_packet(raw)
+def run_appliance(live, iface) -> None:
+    if live:
+        print(f"Listening on {iface}...")
+    
+    def handle(pkt):
+        print(pkt)
+    
+    sniff(iface=iface, prn=handle, store=False)
+    
+    # ih = InterfaceHandler(cap_file)
+    # pe = PacketEngine(ih)
+    # while True:
+    #     raw = ih.next_packet()
+    #     if raw is None:
+    #         break
+    #     pe.process_packet(raw)
 
 # --------------- Main ---------------
 # DO NOT modify the run_appliance call
@@ -840,7 +861,11 @@ def run_appliance(cap_file: str = "traffic.spcap") -> None:
 # instead of calling main() to do it
 
 def main():
-    run_appliance("traffic.spcap")
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--live":
+        iface = sys.argv[2] if len (sys.argv) > 2 else "etho0"
+        run_appliance(True, iface)
+    
 
 if __name__ == "__main__":
     main()
