@@ -918,7 +918,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--live":
         iface = sys.argv[2] if len (sys.argv) > 2 else "enp0s1"
         run_appliance(None)
-    else: run_appliance("traffic.scap")
+    else: run_appliance("traffic.spcap")
 
 if __name__ == "__main__":
     main()
