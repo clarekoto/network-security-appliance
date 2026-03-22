@@ -20,9 +20,12 @@ UDP = {"src_port": (192, 16), "dest_port": (208, 16), "payload": 224}
 ICMP = {"type": (192, 8), "code": (200, 8), "header": (208, 32), "payload": 240}
 # ICMP_SIZE = {"type": }
 FLAG_MASKS = {"CWR": 0b10000000, "ECE": 0b01000000, "URG": 0b00100000, "ACK": 0b00010000, "PSH": 0b00001000, "RST": 0b00000100, "SYN": 0b00000010, "FIN": 0b00000001}
-# Define your classes and functions here
 STR_MACS = {"mgt": "28ee5285f23a", "int": "28ee52e2b730", "dmz": "28ee524c4d70", "ext": "28ee529c61ab"}
 STR_IPS = {"ext": "8266b801" }
+INTERFACE_MAP = {
+    "enp0s1": "ext", # my VM's main interface
+    "lo": "mgt", # loopback is management
+}
 
 
 def scapy_to_hex(pkt):
@@ -70,12 +73,81 @@ class Interface:
 class InterfaceHandler:
     #instantiate the 4 nics here
     def __init__(self, cap_file):
-        self.file = open(cap_file, "r")
+        self.file = None
+        if cap_file:
+            self.file = open(cap_file, "r")
+
         self.mgt = Interface("mgt", "28:ee:52:85:f2:3a", "255.255.240.0", "192.168.96.23")
         self.int = Interface("int", "28:ee:52:e2:b7:30", "255.255.0.0", "10.0.0.1")
         self.dmz = Interface("dmz", "28:ee:52:4c:4d:70", "255.255.255.0", "10.1.0.1")
         self.ext = Interface("ext", "28:ee:52:9c:61:ab", "255.255.255.0", "130.102.184.1")
         self.IFACE_NETWORKS = {"192.168.96.0": "mgt", "10.0.0.0": "int", "10.1.0.0": "dmz", "130.102.184.0": "ext"}
+
+    def scapy_to_custom_format(self, scapy_pkt, ingress="ext"):
+        import struct
+
+        # only handle IP packets
+        if IP not in scapy_pkt:
+            return None
+
+        interface_bytes = {
+            "mgt": "a8", "int": "a9",
+            "dmz": "aa", "ext": "ab"
+        }
+
+        # get MACs
+        if Ether in scapy_pkt:
+            src_mac = scapy_pkt[Ether].src.replace(':', '')
+            dst_mac = scapy_pkt[Ether].dst.replace(':', '')
+        else:
+            src_mac = "000000000000"
+            dst_mac = "000000000000"
+
+        # get protocol number
+        proto = scapy_pkt[IP].proto
+        proto_hex = format(proto, '02x')
+
+        # get IPs as hex
+        src_ip = struct.pack('!I', struct.unpack('!I', 
+            inet_aton(scapy_pkt[IP].src))[0]).hex()
+        dst_ip = struct.pack('!I', struct.unpack('!I', 
+            inet_aton(scapy_pkt[IP].dst))[0]).hex()
+
+        # build common header
+        header = (interface_bytes[ingress] + dst_mac + src_mac +
+                "0800" + proto_hex + src_ip + dst_ip)
+
+        # add protocol specific fields
+        if TCP in scapy_pkt:
+            src_port = format(scapy_pkt[TCP].sport, '04x')
+            dst_port = format(scapy_pkt[TCP].dport, '04x')
+            seq = format(scapy_pkt[TCP].seq, '08x')
+            ack = format(scapy_pkt[TCP].ack, '08x')
+            flags = format(int(scapy_pkt[TCP].flags), '02x')
+            payload = bytes(scapy_pkt[TCP].payload).hex()
+            return header + src_port + dst_port + seq + ack + flags + payload
+
+        elif UDP in scapy_pkt:
+            src_port = format(scapy_pkt[UDP].sport, '04x')
+            dst_port = format(scapy_pkt[UDP].dport, '04x')
+            payload = bytes(scapy_pkt[UDP].payload).hex()
+            return header + src_port + dst_port + payload
+
+        elif ICMP in scapy_pkt:
+            icmp_type = format(scapy_pkt[ICMP].type, '02x')
+            icmp_code = format(scapy_pkt[ICMP].code, '02x')
+            icmp_id = format(
+                scapy_pkt[ICMP].id if hasattr(scapy_pkt[ICMP], 'id') else 0, 
+                '04x'
+            )
+            icmp_seq = format(
+                scapy_pkt[ICMP].seq if hasattr(scapy_pkt[ICMP], 'seq') else 0, 
+                '04x'
+            )
+            payload = bytes(scapy_pkt[ICMP].payload).hex()
+            return header + icmp_type + icmp_code + icmp_id + icmp_seq + payload
+
+        return None
 
     """read “packets” from a special (again PCAP-like, but not PCAP special
     format “traffic.spcap” (packet capture) file in the same directory as the code"""
@@ -90,12 +162,7 @@ class InterfaceHandler:
             if data[len(data) - 1] == '\n':
                 data = data[0: len(data) - 1]
             return data
-    
-    def live_capture(self, interface, packet_engine):
-        print(f"Listening on {interface}")
-
-
-        
+  
         """to “send out” packets via the appropriate
     interfaces (referenced by the 3-character string mgt/int/dmz/ext) send_packet method"""    
     def send_packet(self, interface: str, packet: bytes):
@@ -635,15 +702,7 @@ messages); """
                 # drop any other icmp traffic
                 print("ALERT drop: ICMP type " + str(pkt["type"]) + ":" + str(pkt["code"]) + " not allowed by policy")
                 return False
-        
-        # src_ip = pkt["src_ip"]
-        # src_port = pkt["src_port"]
-        # # since i put the 
-        # if self.pt.get_pat_in_actual(pkt["dest_port"]):
-        #     dest_ip, dest_port = self.pt.get_pat_in_actual(pkt["dest_port"])
 
-        # if self.pt.get_pat_out(pkt["src_ip"], pkt["src_port"]):
-        #     src_ip = "130.102.184.1" 
         # check state using pat as well
         state = self.connections.state(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"], pkt["dest_port"])
         self.non_ping += 1
@@ -828,44 +887,38 @@ tion address and port, the connection state (“new”, “syn_sent”, “estab
                   f"{src_ip}:{src_port} -> {dst_ip}:{dst_p}")
 
 
+def run_appliance(cap_file) -> None:
+    ih = InterfaceHandler(cap_file)
+    pe = PacketEngine(ih)
 
-
-
-# ------------------- Simulator runner -------------------
-# DO NOT MODIFY the run_appliance definition IN ANY WAY
-# It MUST work as run_appliance("filename.spcap") as defined here
-
-def run_appliance(live, iface) -> None:
-    if live:
-        print(f"Listening on {iface}...")
+    if not cap_file:
+        print("Listening...")
+ 
+        def handle(pkt):
+            try:
+                iface = pkt.sniffed_on
+                print(iface)
+                logical_iface = INTERFACE_MAP.get(iface, "ext") # if iface is unknown its treated as external
+                hex_packet = ih.scapy_to_format(pkt)
+                if hex_packet:
+                    pe.process_packet(hex_packet)
+            except Exception as e:
+                print(f"Error processing packet: {e}")
     
-    def handle(pkt):
-        print(pkt)
-    
-    sniff(iface=iface, prn=handle, store=False)
-    
-    # ih = InterfaceHandler(cap_file)
-    # pe = PacketEngine(ih)
-    # while True:
-    #     raw = ih.next_packet()
-    #     if raw is None:
-    #         break
-    #     pe.process_packet(raw)
-
-# --------------- Main ---------------
-# DO NOT modify the run_appliance call
-# It MUST work as run_appliance("traffic.spcap")
-#
-# Leaving a main() wrapper for those who like it
-# You could just as easily run_appliance("traffic.spcap") directly
-# instead of calling main() to do it
+        sniff( prn=handle, store=False)
+    else: 
+        while True:
+            raw = ih.next_packet()
+            if raw is None:
+                break
+            pe.process_packet(raw)
 
 def main():
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--live":
-        iface = sys.argv[2] if len (sys.argv) > 2 else "etho0"
-        run_appliance(True, iface)
-    
+        iface = sys.argv[2] if len (sys.argv) > 2 else "enp0s1"
+        run_appliance(None)
+    else: run_appliance("traffic.scap")
 
 if __name__ == "__main__":
     main()
