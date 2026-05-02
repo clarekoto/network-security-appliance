@@ -1,171 +1,119 @@
 from __future__ import annotations
-import os
-import sys
-import struct
 import random
-import ipaddress
-from socket import inet_aton
-from scapy.all import sniff, Ether, IP, TCP, UDP, ICMP, raw
-from dataclasses import dataclass, field
-from typing import Dict, Tuple, Optional, List, Any
-from support import *
+from scapy.all import sniff, Ether, IP, TCP, UDP, ICMP, Raw, sendp, get_if_hwaddr, get_if_addr
+from support import ip_to_int, int_to_ip
 
-# ------CONSTANTS--------
-# where each part in a packet starts
-HEADER = {"first_byte": (0, 8), "dest_mac": (8, 48), "src_mac": (56, 48), "protocol": (120, 8), "src_ip": (128, 32), "dest_ip": (160, 32)}
-# HEADER_SIZES = {"first_byte": 8, "dest_mac": 48, "src_mac": 48, "protocol": 8, "src_ip": 32, "dest_ip": 32}
-TCP_HDR = {"src_port": (192, 16), "dest_port": (208, 16), "sequence": (224, 32), "ack": (256, 32), "flag": (288, 8), "payload": 296}
-# TCP_SIZE = {"src_port": 16, "dest_port": 16, "sequence": 32, "ack": 32, "flag": 8}
-UDP_HDR = {"src_port": (192, 16), "dest_port": (208, 16), "payload": 224}
-# UDP_SIZE = {"src_port": 16, "dest_port": 16}
-ICMP_HDR = {"type": (192, 8), "code": (200, 8), "header": (208, 32), "payload": 240}
-# ICMP_SIZE = {"type": }
-FLAG_MASKS = {"CWR": 0b10000000, "ECE": 0b01000000, "URG": 0b00100000, "ACK": 0b00010000, "PSH": 0b00001000, "RST": 0b00000100, "SYN": 0b00000010, "FIN": 0b00000001}
-STR_MACS = {"mgt": "28ee5285f23a", "int": "28ee52e2b730", "dmz": "28ee524c4d70", "ext": "28ee529c61ab"}
-STR_IPS = {"ext": "8266b801" }
+def format_packet(pkt):
+    if IP not in pkt:
+        return pkt.summary()
+    src = pkt[IP].src
+    dst = pkt[IP].dst
+    proto = pkt[IP].proto
+    if proto == 1:
+        t = pkt[ICMP].type if ICMP in pkt else "?"
+        names = {0: "echo-reply", 8: "echo-request", 3: "unreachable", 11: "time-exceeded"}
+        return f"ICMP  {src} -> {dst}  ({names.get(t, f'type {t}')})"
+    elif proto == 6 and TCP in pkt:
+        flags = pkt[TCP].flags
+        return f"TCP   {src}:{pkt[TCP].sport} -> {dst}:{pkt[TCP].dport}  [{flags}]"
+    elif proto == 17 and UDP in pkt:
+        return f"UDP   {src}:{pkt[UDP].sport} -> {dst}:{pkt[UDP].dport}"
+    return pkt.summary()
+
+def _read_mac(iface, fallback):
+    try:
+        return get_if_hwaddr(iface)
+    except Exception:
+        return fallback
+
+def _read_ip(iface, fallback):
+    try:
+        return get_if_addr(iface)
+    except Exception:
+        return fallback
+
+# ---------------------- Constants ----------------------
+
+FLAG_MASKS = {
+    "CWR": 0b10000000, "ECE": 0b01000000, "URG": 0b00100000,
+    "ACK": 0b00010000, "PSH": 0b00001000, "RST": 0b00000100,
+    "SYN": 0b00000010, "FIN": 0b00000001
+}
+
+# MAC addresses for each logical interface
+STR_MACS = {
+    "mgt": "ee:21:c0:9c:80:87",
+    "int": "8e:e8:02:3a:00:f9",
+    "dmz": "46:49:15:3d:47:15",
+    "ext": "a6:6a:20:d1:68:d4"
+}
+
+# Map physical interface names to logical interface names
 INTERFACE_MAP = {
-    "enp0s1": "ext", # my VM's main interface
-    "lo": "mgt", # loopback is management
+    "enp0s1": "int",   # internal network (shared network, internet access)
+    "enp0s2": "ext",   # external network (host only)
+    "enp0s3": "dmz",   # DMZ (host only) - add adapter in UTM when ready
+    "enp0s4": "mgt",   # management (host only) - add adapter in UTM when ready
+    "lo":     "mgt",   # loopback treated as management
+}
+
+# Map physical interface names for sending replies
+IFACE_SEND = {
+    "int": "enp0s1",
+    "ext": "enp0s2",
+    "dmz": "enp0s3",
+    "mgt": "enp0s4",
 }
 
 
-def scapy_to_hex(pkt):
-    # convert the raw packet bytes to hex string
-    # this is the same format your spcap file uses
-    raw_bytes = bytes(pkt)
-    return raw_bytes.hex()
+# ---------------------- Interface ----------------------
 
 class Interface:
-    # have name as a variable so i can run send_packet
     def __init__(self, name, mac_address, mask, ip_address):
+        self.name = name
         self.mac = mac_address
         self.mask = mask
         self.ip_address = ip_address
-        self.name = name
-        
-    def get_mac(self):
-        return self.mac
-    
-    def set_mac(self, mac_address):
-        self.mac = mac_address
-    
-    def get_ip(self):
-        return self.ip_address
-    
-    def set_ip(self, ip_address):
-        self.ip_address = ip_address
-    
-    def get_mask(self):
-        return self.mask
-    
-    def set_mask(self, netmask):
-        self.mask = netmask
 
-    def get_default(self):
-        return self.ip_address
-    
-    def set_default(self, ip_address):
-        self.ip_address = ip_address
+    def get_mac(self): return self.mac
+    def set_mac(self, mac): self.mac = mac
+    def get_ip(self): return self.ip_address
+    def set_ip(self, ip): self.ip_address = ip
+    def get_mask(self): return self.mask
+    def set_mask(self, mask): self.mask = mask
 
-    # use .hex()
-    def send_packet(self, packet: bytes):
-        print(self.name + ": sent packet " + packet)
+    def send_packet(self, packet):
+        iface = IFACE_SEND.get(self.name)
+        if iface:
+            try:
+                sendp(packet, iface=iface, verbose=False)
+            except (ValueError, OSError):
+                pass  # interface not available when running locally
+
+
+# ------------------- InterfaceHandler -------------------
 
 class InterfaceHandler:
-    #instantiate the 4 nics here
-    def __init__(self, cap_file):
-        self.file = None
-        if cap_file:
-            self.file = open(cap_file, "r")
+    def __init__(self):
+        self.mgt = Interface("mgt", _read_mac("enp0s4", "ee:21:c0:9c:80:87"), "255.255.255.0", _read_ip("enp0s4", "192.168.58.2"))
+        self.int = Interface("int", _read_mac("enp0s1", "8e:e8:02:3a:00:f9"), "255.255.255.0", _read_ip("enp0s1", "192.168.64.2"))
+        self.dmz = Interface("dmz", _read_mac("enp0s3", "46:49:15:3d:47:15"), "255.255.255.0", _read_ip("enp0s3", "192.168.57.2"))
+        self.ext = Interface("ext", _read_mac("enp0s2", "a6:6a:20:d1:68:d4"), "255.255.255.0", _read_ip("enp0s2", "192.168.56.2"))
 
-        self.mgt = Interface("mgt", "28:ee:52:85:f2:3a", "255.255.240.0", "192.168.96.23")
-        self.int = Interface("int", "28:ee:52:e2:b7:30", "255.255.0.0", "10.0.0.1")
-        self.dmz = Interface("dmz", "28:ee:52:4c:4d:70", "255.255.255.0", "10.1.0.1")
-        self.ext = Interface("ext", "28:ee:52:9c:61:ab", "255.255.255.0", "130.102.184.1")
-        self.IFACE_NETWORKS = {"192.168.96.0": "mgt", "10.0.0.0": "int", "10.1.0.0": "dmz", "130.102.184.0": "ext"}
+        STR_MACS["mgt"] = self.mgt.get_mac()
+        STR_MACS["int"] = self.int.get_mac()
+        STR_MACS["dmz"] = self.dmz.get_mac()
+        STR_MACS["ext"] = self.ext.get_mac()
 
-    def scapy_to_format(self, scapy_pkt, ingress="ext"):
-        import struct
-
-        # only handle IP packets
-        if IP not in scapy_pkt:
-            return None
-
-        interface_bytes = {
-            "mgt": "a8", "int": "a9",
-            "dmz": "aa", "ext": "ab"
+        # Used by RouteTable to resolve egress interface from dest IP
+        self.IFACE_NETWORKS = {
+            "192.168.58.0": "mgt",
+            "192.168.64.0": "int",
+            "192.168.57.0": "dmz",
+            "192.168.56.0": "ext",
         }
 
-        # get MACs
-        if Ether in scapy_pkt:
-            src_mac = scapy_pkt[Ether].src.replace(':', '')
-            dst_mac = scapy_pkt[Ether].dst.replace(':', '')
-        else:
-            src_mac = "000000000000"
-            dst_mac = "000000000000"
-
-        # get protocol number
-        proto = scapy_pkt[IP].proto
-        proto_hex = format(proto, '02x')
-
-        # get IPs as hex
-        src_ip = struct.pack('!I', struct.unpack('!I', 
-            inet_aton(scapy_pkt[IP].src))[0]).hex()
-        dst_ip = struct.pack('!I', struct.unpack('!I', 
-            inet_aton(scapy_pkt[IP].dst))[0]).hex()
-
-        # build common header
-        header = (interface_bytes[ingress] + dst_mac + src_mac +
-                "0800" + proto_hex + src_ip + dst_ip)
-        # add protocol specific fields
-        if TCP in scapy_pkt:
-            src_port = format(scapy_pkt[TCP].sport, '04x')
-            dst_port = format(scapy_pkt[TCP].dport, '04x')
-            seq = format(scapy_pkt[TCP].seq, '08x')
-            ack = format(scapy_pkt[TCP].ack, '08x')
-            flags = format(int(scapy_pkt[TCP].flags), '02x')
-            payload = bytes(scapy_pkt[TCP].payload).hex()
-            return header + src_port + dst_port + seq + ack + flags + payload
-
-        elif UDP in scapy_pkt:
-            src_port = format(scapy_pkt[UDP].sport, '04x')
-            dst_port = format(scapy_pkt[UDP].dport, '04x')
-            payload = bytes(scapy_pkt[UDP].payload).hex()
-            return header + src_port + dst_port + payload
-
-        elif ICMP in scapy_pkt:
-            icmp_type = format(scapy_pkt[ICMP].type, '02x')
-            icmp_code = format(scapy_pkt[ICMP].code, '02x')
-            icmp_id = format(
-                scapy_pkt[ICMP].id if hasattr(scapy_pkt[ICMP], 'id') else 0, 
-                '04x'
-            )
-            icmp_seq = format(
-                scapy_pkt[ICMP].seq if hasattr(scapy_pkt[ICMP], 'seq') else 0, 
-                '04x'
-            )
-            payload = bytes(scapy_pkt[ICMP].payload).hex()
-            return header + icmp_type + icmp_code + icmp_id + icmp_seq + payload
-
-        return None
-
-    """read “packets” from a special (again PCAP-like, but not PCAP special
-    format “traffic.spcap” (packet capture) file in the same directory as the code"""
-    def next_packet(self):
-        data = self.file.readline()
-        if not data:
-            self.file.close()
-            return None
-        if data[0] == '#':
-            return self.next_packet()
-        else:
-            if data[len(data) - 1] == '\n':
-                data = data[0: len(data) - 1]
-            return data
-  
-        """to “send out” packets via the appropriate
-    interfaces (referenced by the 3-character string mgt/int/dmz/ext) send_packet method"""    
-    def send_packet(self, interface: str, packet: bytes):
+    def send_packet(self, interface: str, packet):
         if interface == "mgt":
             self.mgt_packet(packet)
         elif interface == "int":
@@ -175,71 +123,98 @@ class InterfaceHandler:
         elif interface == "ext":
             self.ext.send_packet(packet)
 
+    def mgt_packet(self, packet):
+        print(f"ROUTE mgt (management) | {format_packet(packet)}")
 
-        """ to be “actioned” by the simulated appliance itself, by printing a
-    message “Actioned management packet ” + the entire packet as a string in hexadecimal digits."""
-    def mgt_packet(self, packet: bytes):
-        print("Actioned management packet " + packet)
-    
-    def get_int_interface(self):
-        return self.int
-    
-    def get_dmz_interface(self):
-        return self.dmz
-    
-    def get_mgt_interface(self):
-        return self.mgt
-    
-    def get_ext_interface(self):
-        return self.ext
+    def get_int_interface(self): return self.int
+    def get_dmz_interface(self): return self.dmz
+    def get_mgt_interface(self): return self.mgt
+    def get_ext_interface(self): return self.ext
 
 
-    
+# ---------------------- PatTable ----------------------
 
-    
 class PatTable:
-
     def __init__(self):
-        self.table = {}
-    """ adds the translation to the
-    table and prints the message “NAT: allocate in_address:in_port -> out_address:out_port” – these are
-    never removed in our simulated appliance – once set, the same combination of in_address and in_port
-    will always be assigned the same out_port (in a real appliance these would need to be removed when no
-    longer used otherwise the table would fill or all available ports would be allocated);"""
+        # (in_address, in_port) -> out_port
+        self.table: dict = {}
+
     def set_pat(self, in_address: str, in_port: int, out_port: int):
         if (in_address, in_port) not in self.table:
             self.table[(in_address, in_port)] = out_port
-            in_port_str = str(int(in_port, 16))
-            out_port_str = str(int(out_port, 16))
-            print("NAT: allocate " + in_address + ":" + in_port_str + " -> 130.102.184.1:" + out_port_str)
+            print(f"NAT: allocate {in_address}:{in_port} -> 130.102.184.1:{out_port}")
 
-    """that returns a random ephemeral port number (ports 49152 – 65535) that
-    is not already in the table;"""
-    def get_unused_port(self):
+    def get_unused_port(self) -> int:
         port = random.randint(49152, 65535)
         while port in self.table.values():
             port = random.randint(49152, 65535)
         return port
 
-
-    """that returns the IP:port as a string of the IPv4-dotted-quad:port;"""
     def get_pat_in(self, out_port: int):
+        """Return 'ip:port' string for a given external port, or None."""
         for (in_address, in_port), port in self.table.items():
             if port == out_port:
-                in_port_str = str(int(in_port, 16))
-                return in_address + ":" + in_port_str
-    
+                return f"{in_address}:{in_port}"
+        return None
+
     def get_pat_in_actual(self, out_port: int):
+        """Return (in_address, in_port) tuple for a given external port."""
         for (in_address, in_port), port in self.table.items():
             if port == out_port:
                 return in_address, in_port
-    
+        return None, None
 
-    """that returns the external port number."""
     def get_pat_out(self, in_address: str, in_port: int):
-        for (key1, key2), port in self.table.items():
-                if key1 == in_address and key2 == in_port:
-                    return port
+        """Return the external port for a given internal address and port."""
+        return self.table.get((in_address, in_port))
+
+
+# --------------------- Connections ---------------------
+
+class Connections:
+    def __init__(self):
+        # (nic, proto, src_ip, src_port, dst_ip, dst_port) -> state
+        self.table: dict = {}
+
+    def add_or_update(self, nic, proto, src_ip, src_port, dst_ip, dst_port, state):
+        self.table[(nic, proto, src_ip, src_port, dst_ip, dst_port)] = state
+
+    def state(self, nic, proto, src_ip, src_port, dst_ip, dst_port):
+        return self.table.get((nic, proto, src_ip, src_port, dst_ip, dst_port))
+
+    def clear_table(self):
+        """Remove all incomplete (syn_sent) connections."""
+        self.table = {k: v for k, v in self.table.items() if v != "syn_sent"}
+
+    def print_table(self):
+        if not self.table:
+            print("Connections table is empty.")
+            return
+        print("Current connections:")
+        for (nic, proto, src_ip, src_port, dst_ip, dst_port), state in self.table.items():
+            print(f"  [{state.upper()}] {nic} | proto={proto} | {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
+
+
+# --------------------- RouteTable ---------------------
+
+class RouteTable:
+    def __init__(self, ih: InterfaceHandler):
+        self.ih = ih
+        # Masks in descending prefix length order (longest prefix match)
+        self.MASKS = [0xffffff00, 0xffff0000, 0xfffff000]
+
+    def resolve(self, ip: str) -> str:
+        """Return egress interface name for a destination IP (longest-prefix match)."""
+        ip_int = ip_to_int(ip)
+        for mask in self.MASKS:
+            network_ip = int_to_ip(ip_int & mask)
+            interface = self.ih.IFACE_NETWORKS.get(network_ip)
+            if interface is not None:
+                return interface
+        return "ext"
+
+
+# --------------------- PacketEngine --------------------
 
 class PacketEngine:
     def __init__(self, ih: InterfaceHandler):
@@ -249,675 +224,534 @@ class PacketEngine:
         self.connections = Connections()
         self.ping_window = 0
         self.non_ping = 0
-        self.packet_num = 0
         self.incomplete_num = 0
+        self.curr_packet: dict = {}
 
-        
-    # size is in bits so divide by 4 since the packet is in hex
-    def read_packet(self, packet: bytes, pointer: int, size: int):
-        pointer //= 4
-        size //= 4
-        pack = packet[pointer: pointer + size]
-        return pack
-    
-    def str_hex_to_binary(self, chunk):
-        binary = bin(int(chunk, 16))
-        return int(binary, 2)
+    # -------------------- Parsing --------------------
 
-    def int_to_hex_str(self, chunk, length):
-        hexa = hex(chunk)[2:]
-        if len(hexa) < length:
-            hexa = ((length - len(hexa)) * "0") + hexa
-        
-        return str(hexa)
+    def parse_packet(self, pkt, ingress: str) -> dict:
+        """Parse a Scapy packet into a flat info dictionary."""
+        info = {}
+        info["ingress"] = ingress
+        info["src_mac"] = pkt[Ether].src if Ether in pkt else "00:00:00:00:00:00"
+        info["dest_mac"] = pkt[Ether].dst if Ether in pkt else "00:00:00:00:00:00"
+        info["protocol"] = pkt[IP].proto   # 1=ICMP, 6=TCP, 17=UDP
+        info["src_ip"] = pkt[IP].src
+        info["dest_ip"] = pkt[IP].dst
+        info["egress"] = self.rt.resolve(info["dest_ip"])
 
-    # new_ip will be in pv4 for 102.22. ect
-    def replace_dest_ip(self, packet, new_ip):
-        ip = ip_to_int(new_ip)
-        ip = str(hex(ip))
-        ip = ip[2:]
-        if len(ip) == 7:
-            ip = "0" + ip
-        new_packet = packet[:HEADER["dest_ip"][0]//4] + ip + packet[HEADER["dest_ip"][0]//4 + HEADER["dest_ip"][1]//4:]
-        return new_packet
+        # Defaults so all keys always exist
+        info["src_port"] = 0
+        info["dest_port"] = 0
+        info["flags"] = 0
+        info["seq"] = 0
+        info["ack"] = 0
+        info["payload"] = b""
+        info["bytes"] = 0
+        info["type"] = 0
+        info["code"] = 0
+        info["icmp_id"] = 0
+        info["icmp_seq"] = 0
 
-    def replace_src_mac(self, packet, new_mac):
-        mac = mac_to_bytes(new_mac)
-        mac = mac.hex()
-        new_packet = packet[:HEADER["src_mac"][0]//4] + mac + packet[HEADER["src_mac"][0]//4 + HEADER["src_mac"][1]//4:]
-        return new_packet
-    
-    def replace_interface(self, packet, interface):
-        if interface == "mgt":
-            new_packet = "a8" + packet[2:]
-        elif interface == "int":
-            new_packet = "a9" + packet[2:]
-        elif interface == "dmz":
-            new_packet = "aa" + packet[2:]
-        elif interface == "ext":
-            new_packet = "ab" + packet[2:]
+        if ICMP in pkt:
+            info["type"] = pkt[ICMP].type
+            info["code"] = pkt[ICMP].code
+            info["icmp_id"] = getattr(pkt[ICMP], "id", 0)
+            info["icmp_seq"] = getattr(pkt[ICMP], "seq", 0)
+            info["payload"] = bytes(pkt[ICMP].payload)
+            info["bytes"] = len(bytes(pkt[IP]))
 
-        return new_packet
-    
-    def create_echo_reply(self, packet):
-        first_byte = self.read_packet(packet, HEADER["first_byte"][0], HEADER["first_byte"][1])
-        dest_mac = self.read_packet(packet, HEADER["src_mac"][0], HEADER["src_mac"][1])
-        src_mac = self.read_packet(packet, HEADER["dest_mac"][0], HEADER["dest_mac"][1])
-        ethertype = "0800"
-        proto = "01"
-        src_ip = self.read_packet(packet, HEADER["dest_ip"][0], HEADER["dest_ip"][1])
-        dest_ip = self.read_packet(packet, HEADER["src_ip"][0], HEADER["src_ip"][1])
-        type = "00"
-        code = "00"
-        header = self.read_packet(packet, ICMP_HDR["header"][0], ICMP_HDR["header"][1])
-        payload = self.read_packet(packet, ICMP_HDR["payload"], len(packet)*4 - ICMP_HDR["payload"])
-        
-        return first_byte + dest_mac + src_mac + ethertype + proto + src_ip + dest_ip + type + code + header + payload
+        if TCP in pkt:
+            # Silently strip URG and PSH flags per policy
+            raw_flags = int(pkt[TCP].flags)
+            info["flags"] = raw_flags & ~(FLAG_MASKS["URG"] | FLAG_MASKS["PSH"])
+            info["src_port"] = pkt[TCP].sport
+            info["dest_port"] = pkt[TCP].dport
+            info["seq"] = pkt[TCP].seq
+            info["ack"] = pkt[TCP].ack
+            info["payload"] = bytes(pkt[TCP].payload)
 
+        elif UDP in pkt:
+            info["src_port"] = pkt[UDP].sport
+            info["dest_port"] = pkt[UDP].dport
+            info["payload"] = bytes(pkt[UDP].payload)
 
+        return info
 
-    def parse_packet(self, packet):
-        # return a dictionary with everything inside
-        packet_info = {}
-        mask = 0b00000011
-        interface = mask & self.str_hex_to_binary(self.read_packet(packet, HEADER["first_byte"][0], HEADER["first_byte"][1]))
-        packet_info["ingress"] = IFACE_NAMES[interface]
+    # -------------------- Packet construction --------------------
 
-        packet_info["dest_mac"] = self.read_packet(packet, HEADER["dest_mac"][0], HEADER["dest_mac"][1])
-        packet_info["src_mac"] = self.read_packet(packet, HEADER["src_mac"][0], HEADER["src_mac"][1])
-        packet_info["protocol"] = self.read_packet(packet, HEADER["protocol"][0], HEADER["protocol"][1])
-        packet_info["src_ip"] = int_to_ip(int(self.read_packet(packet, HEADER["src_ip"][0], HEADER["src_ip"][1]), 16))
-        packet_info["dest_ip"] = int_to_ip(int(self.read_packet(packet, HEADER["dest_ip"][0], HEADER["dest_ip"][1]), 16))
-        packet_info["egress"] = self.rt.resolve(packet_info["dest_ip"])
-        
-        # protocol 1 == ICMP 6 == TCP, 17 == UDP
-        if packet_info["protocol"] == "01":
-            packet_info["type"] = self.str_hex_to_binary(self.read_packet(packet, ICMP_HDR["type"][0], ICMP_HDR["type"][1]))
-            packet_info["code"] = self.str_hex_to_binary(self.read_packet(packet, ICMP_HDR["code"][0], ICMP_HDR["code"][1]))
-            packet_info["header"] = self.read_packet(packet, ICMP_HDR["header"][0], ICMP_HDR["header"][1])
-            packet_info["payload"] = self.read_packet(packet, ICMP_HDR["payload"], len(packet)*4 - ICMP_HDR["payload"])
-            packet_info["bytes"] = len(packet) / 2
-            
-        if packet_info["protocol"] == "06" or packet_info["protocol"] == "11":
-            packet_info["src_port"] = self.read_packet(packet, TCP_HDR["src_port"][0], TCP_HDR["src_port"][1])
-            packet_info["dest_port"] = self.read_packet(packet, TCP_HDR["dest_port"][0], TCP_HDR["dest_port"][1])
-        
-        if packet_info["protocol"] == "06":
-            flags_int = int(self.read_packet(packet, TCP_HDR["flag"][0], TCP_HDR["flag"][1]), 16)
-            flags_int &= ~(FLAG_MASKS["URG"] | FLAG_MASKS["PSH"])
-            packet_info["seq"] = self.read_packet(packet, TCP_HDR["sequence"][0], TCP_HDR["sequence"][1])
-            packet_info["ack"] = self.read_packet(packet, TCP_HDR["ack"][0], TCP_HDR["ack"][1])
-            packet_info["flags"] = self.int_to_hex_str(flags_int, 2)
-            packet_info["payload"] = self.read_packet(packet, TCP_HDR["payload"], len(packet)*4 - TCP_HDR["payload"])
-        
-        if packet_info["protocol"] == "11":
-            packet_info["seq"] = ""
-            packet_info["ack"] = ""
-            packet_info["flags"] = ""
-            packet_info["payload"] = self.read_packet(packet, UDP_HDR["payload"], len(packet)*4 - UDP_HDR["payload"])
+    def create_echo_reply(self, p: dict):
+        """Build an ICMP echo reply from a parsed echo request."""
+        reply = (
+            Ether(src=p["dest_mac"], dst=p["src_mac"]) /
+            IP(src=p["dest_ip"], dst=p["src_ip"]) /
+            ICMP(type=0, code=0, id=p["icmp_id"], seq=p["icmp_seq"])
+        )
+        if p["payload"]:
+            reply /= Raw(p["payload"])
+        return reply
 
-        return packet_info
-
-    def create_reply(self, nic, dest_mac, src_mac, proto, src_ip, dest_ip, src_port, dest_port, seq, ack, flags, payload):
-        
-        if nic == "mgt":
-            new_nic = "a8"
-        elif nic == "int":
-            new_nic = "a9"
-        elif nic == "dmz":
-            new_nic = "aa"
+    def create_reply(self, dest_mac, src_mac, proto, src_ip, dest_ip,
+                     src_port, dest_port, seq, ack, flags, payload):
+        """Build a TCP or UDP reply packet."""
+        eth = Ether(src=src_mac, dst=dest_mac)
+        ip  = IP(src=src_ip, dst=dest_ip)
+        if proto == 6:
+            transport = TCP(sport=src_port, dport=dest_port, seq=seq, ack=ack, flags=flags)
         else:
-            new_nic = "ab"
-        
-        new_src_ip = self.int_to_hex_str(ip_to_int(src_ip), 8)
-        new_dest_ip = self.int_to_hex_str(ip_to_int(dest_ip), 8)
+            transport = UDP(sport=src_port, dport=dest_port)
+        pkt = eth / ip / transport
+        if payload:
+            pkt /= Raw(payload)
+        return pkt
 
-        return new_nic + dest_mac + src_mac + "0800" + proto + new_src_ip + new_dest_ip + src_port + dest_port + seq + ack + flags + payload 
+    # -------------------- Security checks --------------------
 
-    def handle_TCP_UDP(self, packet):
-        pkt = self.curr_packet
-        
-        # Allow incoming DNS traffic (port 53) on int or dmz interfaces (USE PAT) to go external
-        # allow replies to return. 
+    def check_packet(self) -> bool:
+        """Return True if the packet is allowed by policy, False to drop."""
+        p = self.curr_packet
 
-        #state
-        state = self.connections.state(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"], pkt["dest_port"])
+        # --- ICMP ---
+        if p["protocol"] == 1:
+            if p["type"] == 8:  # echo-request
+                if p["bytes"] > 64:
+                    print(f"ALERT drop: oversize ping from {p['src_ip']} ({int(p['bytes'])} bytes)")
+                    return False
+                if self.ping_window >= 5:
+                    print(f"ALERT drop: ping rate limit from {p['src_ip']}")
+                    return False
+                self.ping_window += 1
+                self.non_ping = 0
+                return True
+            else:
+                self.non_ping += 1
+                print(f"ALERT drop: ICMP type {p['type']}:{p['code']} not allowed by policy")
+                return False
 
-        # Allow incoming dns traffic on int or dmz
-        if pkt["ingress"] == "int" or pkt["ingress"] == "dmz":
-            # dns traffic
-            if pkt["dest_port"] == "0035" and pkt["egress"] == "ext":
-                if state == None:
-                    new_state = "established"
-                    if pkt["protocol"] == "06" and pkt["flags"] == "02":
-                            self.incomplete_num += 1
-                            new_state = "syn_sent"
+        # Non-ICMP packet resets ping window tracking
+        self.non_ping += 1
 
-                    # set nat when its new
-                    # DONT FORGET TO UNCOMMENT BELOW
-                    self.pt.set_pat(pkt["src_ip"], pkt["src_port"], self.int_to_hex_str(self.pt.get_unused_port(), 4)) #"e4c9")
-                    # add to conneciton table after pat translation
-                    # add for egress
-                    self.connections.add_or_update(pkt["egress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], "130.102.184.1", self.pt.get_pat_out(pkt   ["src_ip"], pkt["src_port"]), new_state)
-                    self.connections.add_or_update(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"], pkt["dest_port"], new_state)
-                    # self.track_connections(pkt["ingress"], pkt["egress"], pkt["protocol"], "130.102.184.1", self.pt.get_pat_out(pkt["src_ip"], 
-                    #                         pkt["src_port"]), pkt["dest_ip"], pkt["dest_port"], new_state)
-                elif pkt["protocol"] == "06" and state == "syn_sent" and pkt["flags"] == "10":
-                    self.incomplete_num -= 1 #if dmz or int sent ack
-                    self.connections.add_or_update(pkt["egress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], "130.102.184.1", 
-                                                   self.pt.get_pat_out(pkt["src_ip"], pkt["src_port"]), "established")
-                    self.connections.add_or_update(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"], pkt["dest_port"], "established")
-                    # self.track_connections(pkt["ingress"], pkt["egress"], pkt["protocol"], "130.102.184.1", self.pt.get_pat_out(pkt["src_ip"], 
-                    #                         pkt["src_port"]), pkt["dest_ip"], pkt["dest_port"], "established")
-                    
-                # this is outbound so the src_mac and src_ip will be ext
-                return self.create_reply(pkt["egress"], pkt["src_mac"], STR_MACS[pkt["egress"]], pkt["protocol"], "130.102.184.1", pkt["dest_ip"],
-                                         self.pt.get_pat_out(pkt["src_ip"], pkt["src_port"]), pkt["dest_port"], pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
+        # --- Allow already-established connections ---
+        state = self.connections.state(
+            p["ingress"], p["protocol"],
+            p["src_ip"], p["src_port"],
+            p["dest_ip"], p["dest_port"]
+        )
 
-        # allow incoming http and https on int
-        if pkt["ingress"] == "int":
-            # state = self.connections.state(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"], pkt["dest_port"])
-            if pkt["dest_port"] == "0050" or pkt["dest_port"] == "01bb":
-                new_state = "established"
-                if state == None:
-                    if pkt["egress"] == "ext":
-                        self.pt.set_pat(pkt["src_ip"], pkt["src_port"], self.int_to_hex_str(self.pt.get_unused_port(), 4)) #"c64c")
-                    if pkt["flags"] == "02":
-                        self.incomplete_num += 1
-                        new_state = "syn_sent"
-                if state == "syn_sent" and pkt["flags"] == "10":
+        if state == "established":
+            return True
+
+        # Allow SYN-ACK or ACK for in-progress handshakes
+        if state == "syn_sent" and p["flags"] in (
+            FLAG_MASKS["SYN"] | FLAG_MASKS["ACK"],  # 18 = SYN-ACK
+            FLAG_MASKS["ACK"]                        # 16 = ACK
+        ):
+            return True
+
+        # --- TCP-specific checks ---
+        if p["protocol"] == 6:
+
+            # Management interface: only SSH from trusted host
+            if p["ingress"] == "mgt":
+                if p["dest_port"] != 22 or p["src_ip"] != "192.168.96.9":
+                    print("ALERT drop: new incoming TCP not allowed by policy")
+                    return False
+                return True
+
+            # SYN flood protection
+            if p["flags"] == FLAG_MASKS["SYN"]:
+                if self.incomplete_num >= 100:
+                    print("ALERT drop: too many incomplete connections")
+                    self.connections.clear_table()
+                    self.incomplete_num = 0
+                    return False
+
+            # int or dmz → ext DNS
+            if p["ingress"] in ("int", "dmz"):
+                if p["dest_port"] == 53 and p["egress"] == "ext":
+                    return True
+
+            # int → HTTP/HTTPS or SSH outbound
+            if p["ingress"] == "int":
+                if p["dest_port"] in (80, 443) and p["egress"] in ("ext", "dmz"):
+                    return True
+                if p["dest_port"] == 22 and p["egress"] in ("ext", "dmz"):
+                    return True
+                if p["src_port"] == 22 and p["egress"] == "dmz":
+                    return True
+
+            # dmz jump box → int
+            if p["ingress"] == "dmz":
+                if p["src_ip"] == "10.1.0.92" and p["egress"] == "int":
+                    return True
+                if p["dest_port"] == 22 and p["egress"] == "int":
+                    return True
+
+            # ext inbound: HTTP/HTTPS → dmz proxy, SSH → dmz jump box
+            if p["ingress"] == "ext":
+                if p["dest_port"] in (80, 443, 22):
+                    return True
+                # Silently drop inbound DNS queries
+                if p["src_port"] == 53:
+                    return False
+
+        # --- UDP-specific checks ---
+        if p["protocol"] == 17:
+            # int or dmz → ext DNS
+            if p["ingress"] in ("int", "dmz"):
+                if p["dest_port"] == 53 and p["egress"] == "ext":
+                    return True
+            # ext → int/dmz DNS reply (via PAT)
+            if p["ingress"] == "ext":
+                if p["src_port"] == 53 and self.pt.get_pat_in(p["dest_port"]) is not None:
+                    return True
+                # Silently drop new inbound DNS queries
+                if p["dest_port"] == 53:
+                    return False
+
+        print("ALERT drop: new incoming TCP not allowed by policy")
+        return False
+
+    # -------------------- TCP/UDP routing --------------------
+
+    def handle_TCP_UDP(self):
+        """Route an allowed TCP/UDP packet and return the forwarded packet."""
+        p = self.curr_packet
+        state = self.connections.state(
+            p["ingress"], p["protocol"],
+            p["src_ip"], p["src_port"],
+            p["dest_ip"], p["dest_port"]
+        )
+
+        # ---- int or dmz → ext DNS (with PAT) ----
+        if p["ingress"] in ("int", "dmz") and p["dest_port"] == 53 and p["egress"] == "ext":
+            if state is None:
+                new_state = "syn_sent" if (p["protocol"] == 6 and p["flags"] == FLAG_MASKS["SYN"]) else "established"
+                if new_state == "syn_sent":
+                    self.incomplete_num += 1
+                out_port = self.pt.get_unused_port()
+                self.pt.set_pat(p["src_ip"], p["src_port"], out_port)
+                self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], 53, "130.102.184.1", out_port, new_state)
+                self.connections.add_or_update(p["ingress"], p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], 53, new_state)
+            elif state == "syn_sent" and p["protocol"] == 6 and p["flags"] == FLAG_MASKS["ACK"]:
+                self.incomplete_num -= 1
+                out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
+                self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], 53, "130.102.184.1", out_port, "established")
+                self.connections.add_or_update(p["ingress"], p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], 53, "established")
+
+            out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
+            return self.create_reply(
+                p["src_mac"], STR_MACS["ext"], p["protocol"],
+                "130.102.184.1", p["dest_ip"],
+                out_port, p["dest_port"],
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
+
+        # ---- int → HTTP/HTTPS ----
+        if p["ingress"] == "int" and p["dest_port"] in (80, 443):
+            new_state = "established"
+            if state is None:
+                if p["flags"] == FLAG_MASKS["SYN"]:
+                    self.incomplete_num += 1
+                    new_state = "syn_sent"
+                if p["egress"] == "ext":
+                    out_port = self.pt.get_unused_port()
+                    self.pt.set_pat(p["src_ip"], p["src_port"], out_port)
+            elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
+                self.incomplete_num -= 1
+
+            if p["egress"] == "ext":
+                out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
+                self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], p["dest_port"], "130.102.184.1", out_port, new_state)
+                self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], p["dest_port"], new_state)
+                return self.create_reply(
+                    p["dest_mac"], STR_MACS["ext"], p["protocol"],
+                    "130.102.184.1", p["dest_ip"],
+                    out_port, p["dest_port"],
+                    p["seq"], p["ack"], p["flags"], p["payload"]
+                )
+            elif p["egress"] == "dmz":
+                self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], p["dest_port"], p["src_ip"], p["src_port"], new_state)
+                self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], p["dest_port"], new_state)
+                return self.create_reply(
+                    p["dest_mac"], STR_MACS["dmz"], p["protocol"],
+                    p["src_ip"], p["dest_ip"],
+                    p["src_port"], p["dest_port"],
+                    p["seq"], p["ack"], p["flags"], p["payload"]
+                )
+
+        # ---- int → SSH (outbound to ext or dmz) ----
+        if p["ingress"] == "int" and p["dest_port"] == 22:
+            if p["egress"] == "ext":
+                if state is None and p["flags"] == FLAG_MASKS["SYN"]:
+                    self.incomplete_num += 1
+                    out_port = self.pt.get_unused_port()
+                    self.pt.set_pat(p["src_ip"], p["src_port"], out_port)
+                    self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], 22, "130.102.184.1", out_port, "syn_sent")
+                    self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], 22, "syn_sent")
+                elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
                     self.incomplete_num -= 1
+                    out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
+                    self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], 22, "130.102.184.1", out_port, "established")
+                    self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], 22, "established")
+                elif state != "established":
+                    print("ALERT drop: new incoming TCP not allowed by policy")
+                    return None
+                out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
+                return self.create_reply(
+                    p["src_mac"], STR_MACS["ext"], p["protocol"],
+                    "130.102.184.1", p["dest_ip"],
+                    out_port, 22,
+                    p["seq"], p["ack"], p["flags"], p["payload"]
+                )
 
-                if pkt["egress"] == "ext":
-                    self.connections.add_or_update(pkt["egress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], "130.102.184.1", self.pt.get_pat_out(pkt["src_ip"], pkt["src_port"]), new_state)
-                    self.connections.add_or_update(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"], pkt["dest_port"], new_state)
-                    return self.create_reply(pkt["egress"], pkt["dest_mac"], STR_MACS[pkt["egress"]], pkt["protocol"], "130.102.184.1", pkt["dest_ip"], self.pt.get_pat_out(pkt["src_ip"], pkt["src_port"]), pkt["dest_port"], pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-                elif pkt["egress"] == "dmz":
-                    self.connections.add_or_update(pkt["egress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], pkt["src_ip"], pkt["src_port"], new_state)
-                
-                    self.connections.add_or_update(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"],
-                                                pkt["dest_port"], new_state)
-                    return self.create_reply(pkt["egress"], pkt["dest_mac"], STR_MACS[pkt["egress"]], pkt["protocol"], pkt["src_ip"], pkt["dest_ip"], pkt["src_port"], pkt["dest_port"], pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-            
-            # allow ssh traffic 
-            if pkt["dest_port"] == "0016":
-                # allow outbound
-                if pkt["egress"] == "ext":
-                    if state == None and pkt["flags"] == "02":
-                        self.incomplete_num += 1
-                        self.pt.set_pat(pkt["src_ip"], pkt["src_port"], self.int_to_hex_str(self.pt.get_unused_port(), 4))
-                        self.connections.add_or_update(pkt["egress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], "130.102.184.1", self.pt.get_pat_out(pkt["src_ip"], pkt["src_port"]), "syn_sent")
-                        self.connections.add_or_update(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"], pkt["dest_port"], "syn_sent")
-                    elif state == "syn_sent" and pkt["flags"] == "10":
-                        self.incomplete_num -= 1
-                        new_state = "established"
-                        self.connections.add_or_update(pkt["egress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], "130.102.184.1", self.pt.get_pat_out(pkt["src_ip"], pkt["src_port"]), "established")
-                        self.connections.add_or_update(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"], pkt["dest_port"], "established")
-                    elif state != "established":
+            if p["egress"] == "dmz":
+                new_state = "syn_sent"
+                if state is None:
+                    if p["flags"] != FLAG_MASKS["SYN"]:
                         print("ALERT drop: new incoming TCP not allowed by policy")
-                        return ""
+                        return None
+                    self.incomplete_num += 1
+                elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
+                    self.incomplete_num -= 1
+                    new_state = "established"
+                self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], 22, p["src_ip"], p["src_port"], new_state)
+                self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], 22, new_state)
+                return self.create_reply(
+                    p["dest_mac"], STR_MACS["dmz"], p["protocol"],
+                    p["src_ip"], p["dest_ip"],
+                    p["src_port"], 22,
+                    p["seq"], p["ack"], p["flags"], p["payload"]
+                )
 
-                    return self.create_reply(pkt["egress"], pkt["src_mac"], STR_MACS[pkt["egress"]], pkt["protocol"], "130.102.184.1", pkt["dest_ip"],
-                                         self.pt.get_pat_out(pkt["src_ip"], pkt["src_port"]), pkt["dest_port"], pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-                
-                if pkt["egress"] == "dmz":
+        # ---- int SSH reply from dmz (src_port == 22) ----
+        if p["ingress"] == "int" and p["src_port"] == 22 and p["egress"] == "dmz":
+            new_state = "syn_sent"
+            if state is None:
+                if p["flags"] != FLAG_MASKS["SYN"]:
+                    print("ALERT drop: new incoming TCP not allowed by policy")
+                    return None
+                self.incomplete_num += 1
+            elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
+                self.incomplete_num -= 1
+                new_state = "established"
+            self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], p["dest_port"], p["src_ip"], 22, new_state)
+            self.connections.add_or_update("int", p["protocol"], p["src_ip"], 22, p["dest_ip"], p["dest_port"], new_state)
+            return self.create_reply(
+                p["dest_mac"], STR_MACS["dmz"], p["protocol"],
+                p["src_ip"], p["dest_ip"],
+                22, p["dest_port"],
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
+
+        # ---- dmz → HTTP/HTTPS replies ----
+        if p["ingress"] == "dmz" and p["src_port"] in (80, 443):
+            if state is None:
+                return None
+            if state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
+                self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], p["dest_port"], p["src_ip"], p["src_port"], "established")
+                self.connections.add_or_update(p["egress"], p["protocol"], p["dest_ip"], p["dest_port"], p["src_ip"], p["src_port"], "established")
+            src_ip = "130.102.184.1" if p["egress"] == "ext" else p["src_ip"]
+            return self.create_reply(
+                p["dest_mac"], STR_MACS[p["egress"]], p["protocol"],
+                src_ip, p["dest_ip"],
+                p["src_port"], p["dest_port"],
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
+
+        # ---- dmz → SSH replies (back to ext or int) ----
+        if p["ingress"] == "dmz" and p["src_port"] == 22:
+            if state is None:
+                print("ALERT drop: new incoming TCP not allowed by policy")
+                return None
+            if p["egress"] == "ext":
+                return self.create_reply(
+                    p["dest_mac"], STR_MACS["ext"], p["protocol"],
+                    "130.102.184.1", p["dest_ip"],
+                    22, p["dest_port"],
+                    p["seq"], p["ack"], p["flags"], p["payload"]
+                )
+            if p["egress"] == "int":
+                return self.create_reply(
+                    p["dest_mac"], STR_MACS["int"], p["protocol"],
+                    p["src_ip"], p["dest_ip"],
+                    22, p["dest_port"],
+                    p["seq"], p["ack"], p["flags"], p["payload"]
+                )
+
+        # ---- dmz jump box → int SSH ----
+        if p["ingress"] == "dmz" and p["dest_port"] == 22 and p["egress"] == "int":
+            new_state = "syn_sent"
+            if state is None:
+                if p["flags"] != FLAG_MASKS["SYN"]:
+                    print("ALERT drop: new incoming TCP not allowed by policy")
+                    return None
+                self.incomplete_num += 1
+            elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
+                self.incomplete_num -= 1
+                new_state = "established"
+            self.connections.add_or_update("int", p["protocol"], p["dest_ip"], 22, p["src_ip"], p["src_port"], new_state)
+            self.connections.add_or_update("dmz", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], 22, new_state)
+            return self.create_reply(
+                p["dest_mac"], STR_MACS["int"], p["protocol"],
+                p["src_ip"], p["dest_ip"],
+                p["src_port"], 22,
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
+
+        # ---- ext → SSH → dmz jump box ----
+        if p["ingress"] == "ext" and p["dest_port"] == 22:
+            new_state = "syn_sent"
+            if state is None:
+                if p["flags"] != FLAG_MASKS["SYN"]:
+                    print("ALERT drop: new incoming TCP not allowed by policy")
+                    return None
+                self.incomplete_num += 1
+            elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
+                self.incomplete_num -= 1
+                new_state = "established"
+            p["egress"] = "dmz"
+            p["dest_ip"] = "10.1.0.92"
+            self.connections.add_or_update("ext", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], 22, new_state)
+            self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], 22, p["src_ip"], p["src_port"], new_state)
+            return self.create_reply(
+                p["src_mac"], STR_MACS["dmz"], p["protocol"],
+                p["src_ip"], "10.1.0.92",
+                p["src_port"], 22,
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
+
+        # ---- ext → SSH reply back via PAT ----
+        if p["ingress"] == "ext" and p["src_port"] == 22:
+            dest_ip, dest_port = self.pt.get_pat_in_actual(p["dest_port"])
+            if dest_ip is None:
+                print("ALERT drop: new incoming TCP not allowed by policy")
+                return None
+            egress = self.rt.resolve(dest_ip)
+            return self.create_reply(
+                p["dest_mac"], STR_MACS[egress], p["protocol"],
+                p["src_ip"], dest_ip,
+                22, dest_port,
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
+
+        # ---- ext → HTTP/HTTPS → dmz web proxy ----
+        if p["ingress"] == "ext" and p["dest_port"] in (80, 443):
+            new_state = "established"
+            if state is None:
+                if p["protocol"] == 6 and p["flags"] == FLAG_MASKS["SYN"]:
+                    self.incomplete_num += 1
                     new_state = "syn_sent"
-                    if state == None:
-                        if pkt["flags"] != "02":
-                            print("ALERT drop: new incoming TCP not allowed by policy")
-                            return ""
-                        else:
-                            self.incomplete_num += 1
-                    elif state == "syn_sent" and pkt["flags"] == "10":
-                        self.incomplete_num -= 1
-                        new_state == "established"
-
-                    self.connections.add_or_update(pkt["egress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], pkt["src_ip"], pkt["src_port"], new_state)
-                    self.connections.add_or_update(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"],
-                                                pkt["dest_port"], new_state)
-                    
-                    return self.create_reply(pkt["egress"], pkt["dest_mac"], STR_MACS[pkt["egress"]], pkt["protocol"], pkt["src_ip"], pkt["dest_ip"], pkt["src_port"], pkt["dest_port"], pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-                
-            if pkt["src_port"] == "0016":
-                if pkt["egress"] == "dmz":
-                    new_state = "syn_sent"
-                    if state == None:
-                        if pkt["flags"] != "02":
-                            print("ALERT drop: new incoming TCP not allowed by policy")
-                            return ""
-                        else :
-                            self.incomplete_num += 1
-                    elif state == "syn_sent" and pkt["flags"] == "10":
-                        self.incomplete_num -= 1
-                        new_state == "established"
-
-                    self.connections.add_or_update(pkt["egress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], pkt["src_ip"], pkt["src_port"], new_state)
-                    self.connections.add_or_update(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"],
-                                                pkt["dest_port"], new_state)
-                    
-                    return self.create_reply(pkt["egress"], pkt["dest_mac"], STR_MACS[pkt["egress"]], pkt["protocol"], pkt["src_ip"], pkt["dest_ip"], pkt["src_port"], pkt["dest_port"], pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-
-        if pkt["ingress"] == "dmz":
-            # http replies
-            if pkt["src_port"] == "0050" or pkt["src_port"] == "01bb":
-                if state == None:
-                    return
-                elif state == "syn_sent":
-                    if pkt["flags"] == "10":
-                        self.connections.add_or_update(pkt["inress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], pkt["src_ip"], pkt["src_port"], "established")
-                        self.connections.add_or_update(pkt["egress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], pkt["src_ip"], pkt["src_port"], "established")
-                if pkt["egress"] == "ext":
-                    src_ip = "130.102.184.1"
+            elif state == "syn_sent":
+                if p["protocol"] == 6 and p["flags"] == FLAG_MASKS["ACK"]:
+                    self.incomplete_num -= 1
+                    new_state = "established"
                 else:
-                    src_ip = pkt["src_ip"]
-                return self.create_reply(pkt["egress"], pkt["dest_mac"], STR_MACS[pkt["egress"]], pkt["protocol"], src_ip, pkt["dest_ip"], pkt["src_port"], pkt["dest_port"], pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-            
-            # ssh replies
-            if pkt["src_port"] == "0016":
-                if pkt["egress"] == "ext":
-                    if state == None:
-                        print("ALERT drop: new incoming TCP not allowed by policy")
-                        return ""
-                    src_ip = "130.102.184.1"
-                    return self.create_reply(pkt["egress"], pkt["dest_mac"], STR_MACS[pkt["egress"]], pkt["protocol"], src_ip, pkt["dest_ip"], pkt["src_port"], pkt["dest_port"], pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-
-                if pkt["egress"] == "int":
-                    if state == None:
-                        print("ALERT drop: new incoming TCP not allowed by policy")
-                        return ""
-                    return self.create_reply(pkt["egress"], pkt["dest_mac"], STR_MACS[pkt["egress"]], pkt["protocol"], pkt["src_ip"], pkt["dest_ip"], pkt["src_port"], pkt["dest_port"], pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-
-            if pkt["dest_port"] == "0016":
-                if pkt["egress"] == "int":
                     new_state = "syn_sent"
-                    if state == None:
-                        if pkt["flags"] != "02":
-                            print("ALERT drop: new incoming TCP not allowed by policy")
-                            return ""
-                        else:
-                            self.incomplete_num += 1
-                    elif state == "syn_sent" and pkt["flags"] == "10":
-                        self.incomplete_num -= 1
-                        new_state == "established"
+            self.connections.add_or_update("ext", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], p["dest_port"], new_state)
+            p["egress"] = "dmz"
+            p["dest_ip"] = "10.1.0.54"
+            self.connections.add_or_update("dmz", p["protocol"], "10.1.0.54", p["dest_port"], p["src_ip"], p["src_port"], new_state)
+            return self.create_reply(
+                p["src_mac"], STR_MACS["dmz"], p["protocol"],
+                p["src_ip"], "10.1.0.54",
+                p["src_port"], p["dest_port"],
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
 
-                    self.connections.add_or_update(pkt["egress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], pkt["src_ip"], pkt["src_port"], new_state)
-                    self.connections.add_or_update(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"],
-                                                pkt["dest_port"], new_state)
-                    
-                    return self.create_reply(pkt["egress"], pkt["dest_mac"], STR_MACS[pkt["egress"]], pkt["protocol"], pkt["src_ip"], pkt["dest_ip"], pkt["src_port"], pkt["dest_port"], pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
+        # ---- ext → HTTP/HTTPS reply via PAT ----
+        if p["ingress"] == "ext" and p["src_port"] in (80, 443):
+            dest_ip, dest_port = self.pt.get_pat_in_actual(p["dest_port"])
+            if dest_ip is None:
+                return None
+            egress = self.rt.resolve(dest_ip)
+            return self.create_reply(
+                p["dest_mac"], STR_MACS[egress], p["protocol"],
+                p["src_ip"], dest_ip,
+                p["src_port"], dest_port,
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
 
+        # ---- ext → DNS reply via PAT ----
+        if p["ingress"] == "ext" and p["src_port"] == 53:
+            dest_ip, dest_port = self.pt.get_pat_in_actual(p["dest_port"])
+            if dest_ip is None:
+                return None
+            egress = self.rt.resolve(dest_ip)
+            return self.create_reply(
+                p["src_mac"], STR_MACS[egress], p["protocol"],
+                p["src_ip"], dest_ip,
+                53, dest_port,
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
 
+        return None
 
+    # -------------------- Main processing --------------------
 
-        if pkt["ingress"] == "ext":
-
-            # allow incoming ssh conneciton
-            if pkt["dest_port"] == "0016":
-                new_state = "syn_sent" # fail safe
-                if state == None:
-                    # new connection
-                    if pkt["flags"] == "02":
-                        self.incomplete_num += 1
-                        new_state = "syn_sent"
-                    # all ssh connections should be TCP
-                    else:
-                        print("ALERT drop: new incoming TCP not allowed by policy")
-                        return ""
-                elif state == "syn_sent":
-                    if pkt["flags"] == "10":
-                        self.incomplete_num -= 1
-                        new_state = "established"
-                
-                pkt["egress"] = "dmz"
-                pkt["dest_ip"] = "10.1.0.92"
-
-                self.connections.add_or_update(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"], pkt["dest_port"], new_state)
-                self.connections.add_or_update(pkt["egress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], pkt["src_ip"], pkt["src_port"], new_state)
-                return self.create_reply(pkt["egress"], pkt["src_mac"], STR_MACS[pkt["egress"]], pkt["protocol"], pkt["src_ip"], pkt["dest_ip"], pkt["src_port"], pkt["dest_port"], pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-
-            # reply to ssh on it
-            if pkt["src_port"] == "0016" and self.pt.get_pat_in(pkt["dest_port"]) != None:
-                dest_ip, dest_port = self.pt.get_pat_in_actual(pkt["dest_port"])
-                egress = self.rt.resolve(dest_ip)
-                pkt["egress"] = egress
-                return self.create_reply(egress, pkt["dest_mac"], STR_MACS[egress], pkt["protocol"], pkt["src_ip"], dest_ip, pkt["src_port"],
-                                         dest_port, pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-
-            # dns traffic via pat
-            # this is a reply
-            # state = self.connections.state(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"], pkt["dest_port"])
-            if pkt["src_port"] == "0035" and self.pt.get_pat_in(pkt["dest_port"]) != None:
-                dest_ip, dest_port = self.pt.get_pat_in_actual(pkt["dest_port"])
-                egress = self.rt.resolve(dest_ip)
-                state = self.connections.state(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"], pkt["dest_port"])
-
-                pkt["egress"] = egress
-                pkt["dest_port"] = dest_port #check if this actually changes the packet but its python so it should lol
-                pkt["dest_ip"] = dest_ip
-
-                # if state == "syn_sent" and pkt["flags"] == "10":
-                #     self.connections.add_or_update(egress, pkt["protocol"], dest_ip, dest_port, pkt["src_ip"], pkt["src_port"], "established")
-                # seq, ack, flags = ""
-                # if pkt["protocol"] == "06":
-                #     seq, ack, flags = pkt["sequence"], pkt["ack"], pkt["flags"]
-                
-                return self.create_reply(egress, pkt["src_mac"], STR_MACS[egress], pkt["protocol"], pkt["src_ip"], dest_ip, pkt["src_port"], dest_port, pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-            
-            # allow incoming HTTP/HTTPS on ext allow replies
-            # this is new
-            if pkt["dest_port"] == "0050" or pkt["dest_port"] == "01bb":
-                new_state = "established" # this is a safe guard if all of the ifs fail below
-                if state == None:
-                    # shouldn't be syn-ack only syn or ack
-                    if pkt["protocol"] == "06" and pkt["flags"] == "02":
-                        self.incomplete_num += 1
-                        new_state = "syn_sent"
-                elif state == "syn_sent":
-                    if pkt["protocol"] == "06" and pkt["flags"] == "10":
-                        self.incomplete_num -= 1
-                        new_state = "established"
-                    else:
-                        new_state = "syn_sent"
-
-                self.connections.add_or_update(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"],
-                                            pkt["dest_ip"], pkt["dest_port"], new_state)
-                pkt["egress"] = "dmz"
-                pkt["dest_ip"] = "10.1.0.54"
-                self.connections.add_or_update(pkt["egress"], pkt["protocol"], pkt["dest_ip"], pkt["dest_port"], pkt["src_ip"], pkt["src_port"], new_state)
-
-                return self.create_reply(pkt["egress"], pkt["src_mac"], STR_MACS[pkt["egress"]], pkt["protocol"], pkt["src_ip"],
-                                         pkt["dest_ip"], pkt["src_port"], pkt["dest_port"], pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-            # this is a reply i think
-            if pkt["src_port"] == "0050" or pkt["src_port"] == "01bb" and self.pt.get_pat_in(pkt["dest_port"]) != None:
-                # dont think i have to update connections table. I could tho
-                dest_ip, dest_port = self.pt.get_pat_in_actual(pkt["dest_port"])
-                egress = self.rt.resolve(dest_ip)
-                pkt["egress"] = egress
-                return self.create_reply(egress, pkt["dest_mac"], STR_MACS[egress], pkt["protocol"], pkt["src_ip"], dest_ip, pkt["src_port"],
-                                         dest_port, pkt["seq"], pkt["ack"], pkt["flags"], pkt["payload"])
-                
-
-
-
-        return ""
-
-    """that manages all the processing: performs security checks
-or routing the “packets” to the correct interfaces"""
-    def process_packet(self, packet: bytes):
-        # self.print_packet_info(packet)
-        self.curr_packet = self.parse_packet(packet)
-        pkt = self.curr_packet
-
-        # security checks
-        if not self.check_packet(packet):
+    def process_packet(self, pkt, ingress: str):
+        """Entry point for every packet. Parse, check, then route."""
+        if IP not in pkt:
             return
-        
-        # check for too many ping requests
+
+        self.curr_packet = self.parse_packet(pkt, ingress)
+        p = self.curr_packet
+
+        if not self.check_packet():
+            return
+
+        # Reset ping window after 5 non-ping packets
         if self.non_ping >= 5:
             self.non_ping = 0
             self.ping_window = 0
 
-        reply = ""
-
-        # handle ICMP packets
-        if pkt["protocol"] == "01":
-            reply = self.create_echo_reply(packet)
+        # Route by protocol
+        if p["protocol"] == 1:
+            reply = self.create_echo_reply(p)
+        elif p["ingress"] == "mgt":
+            reply = pkt   # management packets forwarded as-is
         else:
-            if pkt["ingress"] == "mgt":
-                reply = packet
-            else:
-                reply = self.handle_TCP_UDP(packet)
-    
-        if reply == "":
+            reply = self.handle_TCP_UDP()
+
+        if reply is None:
             return
-        
-        
-    
-        
-        self.route_packet(pkt["egress"], reply)
-    
 
-    """that performs security checks (possibly raising alerts – printed
-messages); """
-    def check_packet(self, packet: bytes):
-        pkt = self.curr_packet
+        self.route_packet(p["egress"], reply)
 
-        # ICMP checks
-        if pkt["protocol"] == "01":
-            if pkt["type"] == 8: #and pkt["code"] == 0:
-                # ICMP oversize ping
-                if pkt["bytes"] > 64:
-                    print("ALERT drop: oversize ping from " + pkt["src_ip"] + " (" + str(int(pkt["bytes"])) + " bytes)")
-                    return False
-                # deny 5 or more incoming ping requests
-                if self.ping_window >= 5:
-                    print("ALERT drop: ping rate limit from " + pkt["src_ip"])
-                    return False
-                else:
-                    self.ping_window += 1
-                    self.non_ping = 0
-                    return True
-            else:
-                self.non_ping += 1
-                # drop any other icmp traffic
-                print("ALERT drop: ICMP type " + str(pkt["type"]) + ":" + str(pkt["code"]) + " not allowed by policy")
-                return False
-
-        # check state using pat as well
-        state = self.connections.state(pkt["ingress"], pkt["protocol"], pkt["src_ip"], pkt["src_port"], pkt["dest_ip"], pkt["dest_port"])
-        self.non_ping += 1
-        
-        if state == "established":
-            return True
-        
-        if state == "syn_sent" and (pkt["flags"] == "12" or pkt["flags"] == "10"):
-            return True
-        
-
-        # TCP checks
-        if pkt["protocol"] == "06": 
-            # allow incoming SSH traffic on mgt from specific IP
-            if pkt["ingress"] == "mgt":
-                if pkt["dest_port"] != "0016" or pkt["src_ip"] != "192.168.96.9":
-                    print("ALERT drop: new incoming TCP not allowed by policy")
-                    return False
-                return True
-            
-            # if incoming
-            if pkt["flags"] == "02":
-                # check if over 100 open incomplete connect requests
-                if self.incomplete_num >= 100:
-                    print("ALERT drop: too many incomplete connections")
-                    self.connections.clear_table() #need to actually clear table if its "syn_sent"
-                    self.incomplete_num = 0
-                    return False
-
-                # allow incoming DNS traffic on int or dmz
-                # should already be accepted if its not a syn because it should be in the connections table
-                if pkt["ingress"] == "int" or pkt["ingress"] == "dmz":
-                    #allow dns traffic
-                    # wondering if i should check if its actually going to ext or outside and if its SYN
-                    if pkt["dest_port"] == "0035" and pkt["egress"] == "ext":
-                        return True
-
-                
-            if pkt["ingress"] == "int":
-                # allow incoming HTTP or HTTPS int interfaces
-                if pkt["dest_port"] == "0050" or pkt["dest_port"] == "01bb" and (pkt["egress"] == "ext" or pkt["egress"] == "dmz"):
-                    return True
-                # allow incoming ssh traffic
-                if pkt["dest_port"] == "0016" and (pkt["egress"] == "ext" or pkt["egress"] == "dmz"):
-                    return True
-
-
-        if pkt["ingress"] == "dmz":
-            if pkt["egress"] == "int" and pkt["src_ip"] == "10.1.0.92":
-                return True
-            
-
-        if pkt["ingress"] == "ext":
-            # drop DNS queries new inbound queries
-            if pkt["src_port"] == "0035":
-                #silently dropped
-                # since anything in the connections table is already passed i just need to check for new incoming
-                return False
-            # allow ssh traffic, allow http traffic
-            if pkt["dest_port"] == "0050" or pkt["dest_port"] == "01bb" or pkt["dest_port"] == "0016":
-                return True
-
-        if pkt["protocol"] == "11":
-            if pkt["ingress"] == "int" or pkt["ingress"] == "dmz":
-                    #allow dns traffic
-                    if pkt["dest_port"] == "0035" and pkt["egress"] == "ext":
-                        return True
-            if pkt["ingress"] == "ext":
-                if pkt["src_port"] == "0050" or pkt["src_port"] == "01bb" or pkt["src_port"]:
-                    return True
-                
-        print("ALERT drop: new incoming TCP not allowed by policy")
-        return False
-                
-                
-            
-
-    """ that simulates sending a packet to that
-interface for sending."""
-    def route_packet(self, interface: str, packet: bytes):
-        if interface != "mgt":
-            print("ROUTE to " + interface)
+    def route_packet(self, interface: str, packet):
+        print(f"ROUTE {interface:<4} | {format_packet(packet)}")
         self.ih.send_packet(interface, packet)
-    
-    def print_packet_info(self, packet: bytes):
-        """Pretty-print key fields from the packet for debugging."""
-        self.packet_num += 1
-        try:
-            proto = self.str_hex_to_binary(self.read_packet(packet, HEADER["protocol"][0], HEADER["protocol"][1]))
-            src_ip = int_to_ip(int(self.read_packet(packet, HEADER["src_ip"][0], HEADER["src_ip"][1]), 16))
-            dst_ip = int_to_ip(int(self.read_packet(packet, HEADER["dest_ip"][0], HEADER["dest_ip"][1]), 16))
-
-            print("\n========== PACKET " + str(self.packet_num) + " ==========")
-            print(f"Raw: {packet}")
-            print(f"Protocol: {proto} ({'ICMP' if proto==1 else 'TCP' if proto==6 else 'UDP' if proto==17 else 'Other'})")
-            print(f"Source IP: {src_ip}")
-            print(f"Destination IP: {dst_ip}")
-
-            if proto == 1:  # ICMP
-                icmp_type = self.str_hex_to_binary(self.read_packet(packet, ICMP_HDR['type'][0], ICMP_HDR['type'][1]))
-                icmp_code = self.str_hex_to_binary(self.read_packet(packet, ICMP_HDR['code'][0], ICMP_HDR['code'][1]))
-                print(f"ICMP -> Type: {icmp_type}, Code: {icmp_code}")
-
-            elif proto == 6:  # TCP
-                src_port = self.str_hex_to_binary(self.read_packet(packet, TCP_HDR['src_port'][0], TCP_HDR['src_port'][1]))
-                dst_port = self.str_hex_to_binary(self.read_packet(packet, TCP_HDR['dest_port'][0], TCP_HDR['dest_port'][1]))
-                seq = self.str_hex_to_binary(self.read_packet(packet, TCP_HDR['sequence'][0], TCP_HDR['sequence'][1]))
-                ack = self.str_hex_to_binary(self.read_packet(packet, TCP_HDR['ack'][0], TCP_HDR['ack'][1]))
-                flags = self.str_hex_to_binary(self.read_packet(packet, TCP_HDR['flag'][0], TCP_HDR['flag'][1]))
-
-                flag_names = [name for name, mask in FLAG_MASKS.items() if flags & mask]
-
-                print(f"TCP -> Src Port: {src_port}, Dst Port: {dst_port}")
-                print(f"Seq: {seq}, Ack: {ack}")
-                print(f"Flags: {flag_names if flag_names else 'None'}")
-
-            elif proto == 17:  # UDP
-                src_port = self.str_hex_to_binary(self.read_packet(packet, UDP_HDR['src_port'][0], UDP_HDR['src_port'][1]))
-                dst_port = self.str_hex_to_binary(self.read_packet(packet, UDP_HDR['dest_port'][0], UDP_HDR['dest_port'][1]))
-                print(f"UDP -> Src Port: {src_port}, Dst Port: {dst_port}")
-
-            print("============================\n")
-
-        except Exception as e:
-            print(f"[DEBUG ERROR] Could not parse packet: {e}")
-    
-class RouteTable:
-    def __init__(self, ih):
-        self.ih = ih
-        self.MASKS = [0xfffff000, 0xffff0000, 0xffffff00]
-
-    """that returns the egress interface name for the destination IP address – longest-
-prefix match among local subnets, else ‘ext’ (default external)."""
-    def resolve(self, ip: str):
-        # get string
-        # convert to binary, apply mask, convert back to ip
-        binary = int(bin(ip_to_int(ip)), 2)
-        for mask in self.MASKS:
-            binary &= mask
-            ip = int_to_ip(binary)
-            interface = self.ih.IFACE_NETWORKS.get(ip)
-            if (interface != None):
-                return interface
-        return "ext"
-                
-    
-
-class Connections:
-
-    def __init__(self):
-        self.table = {}
-        self.incomplete_num = 0
-    """for interface (mgt/int/dmz/ext), protocol, source address and port, destina-
-tion address and port, the connection state (“new”, “syn_sent”, “established”, “closed”);"""
-    def add_or_update(self, nic: str, proto: int, src_ip: str, src_port: int, dst_ip: str, dst_p: int, state: str):
-        self.table.update({(nic, proto, src_ip, src_port, dst_ip, dst_p): state})
-
-    """that returns the connection state (“new”, “syn_sent”, “established”, “closed”) or null if no entry is found."""
-    def state(self, nic: str, proto: int, src_ip: str, src_port: int, dst_ip: str, dst_p: int):
-
-        return self.table.get((nic, proto, src_ip, src_port, dst_ip, dst_p), None)
-        
-    
-    def get_incomplete(self):
-        return self.incomplete_num
-    
-    def clear_table(self):
-        new_table = {}
-        for (nic, proto, src_ip, src_port, dst_ip, dst_p), state in self.table.items():
-            if state != "syn_sent":
-                new_table.update({(nic, proto, src_ip, src_port, dst_ip, dst_p): state})
-        self.table = new_table
-
-    def print_table(self):
-        if not self.table:
-            print("Connections table is empty.")
-            return
-
-        print("Current connections:")
-        for (nic, proto, src_ip, src_port, dst_ip, dst_p), state in self.table.items():
-            print(f"[{state.upper()}] {nic} | Proto {proto} | "
-                  f"{src_ip}:{src_port} -> {dst_ip}:{dst_p}")
 
 
-def run_appliance(cap_file) -> None:
-    ih = InterfaceHandler(cap_file)
+# ---------------------- Entry point ----------------------
+
+def run_appliance() -> None:
+    ih = InterfaceHandler()
     pe = PacketEngine(ih)
+    print("Listening on all interfaces...")
 
-    if not cap_file:
-        print("Listening...")
- 
-        def handle(pkt):
-            try:
-                iface = pkt.sniffed_on
-                logical_iface = INTERFACE_MAP.get(iface, "ext") # if iface is unknown its treated as external
-                hex_packet = ih.scapy_to_format(pkt)
-                if hex_packet:
-                    pe.process_packet(hex_packet)
-            except Exception as e:
-                print(f"Error processing packet: {e}")
-    
-        sniff( prn=handle, store=False, filter="not port 22")
-    else: 
-        while True:
-            raw = ih.next_packet()
-            if raw is None:
-                break
-            pe.process_packet(raw)
+    own_ips = {ih.mgt.get_ip(), ih.int.get_ip(), ih.dmz.get_ip(), ih.ext.get_ip()}
+
+    def handle(pkt):
+        try:
+            if IP not in pkt:
+                return
+            if pkt[IP].src in own_ips:
+                return
+            iface = getattr(pkt, "sniffed_on", None)
+            ingress = INTERFACE_MAP.get(iface, "ext")
+            pe.process_packet(pkt, ingress)
+        except Exception as e:
+            print(f"Error processing packet: {e}")
+
+    own_ip_list = list(own_ips)
+    bpf = "not port 22 and not src host " + " and not src host ".join(own_ip_list)
+    sniff(prn=handle, store=False, iface=list(INTERFACE_MAP.keys()), filter=bpf)
+
 
 def main():
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--live":
-        iface = sys.argv[2] if len (sys.argv) > 2 else "enp0s1"
-        run_appliance(None)
-    else: run_appliance("traffic.spcap")
+    run_appliance()
+
 
 if __name__ == "__main__":
     main()
