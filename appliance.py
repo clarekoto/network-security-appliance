@@ -20,27 +20,16 @@ def format_packet(pkt):
         return f"UDP   {src}:{pkt[UDP].sport} -> {dst}:{pkt[UDP].dport}"
     return pkt.summary()
 
-def _read_mac(iface, fallback):
-    try:
-        return get_if_hwaddr(iface)
-    except Exception:
-        return fallback
-
-def _read_ip(iface, fallback):
-    try:
-        return get_if_addr(iface)
-    except Exception:
-        return fallback
-
 # ---------------------- Constants ----------------------
 
+# bitmasks for each TCP flag used to check and strip flags from the flags byte
 FLAG_MASKS = {
     "CWR": 0b10000000, "ECE": 0b01000000, "URG": 0b00100000,
     "ACK": 0b00010000, "PSH": 0b00001000, "RST": 0b00000100,
     "SYN": 0b00000010, "FIN": 0b00000001
 }
 
-# MAC addresses for each logical interface
+# default MAC addresses for each logical interface
 STR_MACS = {
     "mgt": "ee:21:c0:9c:80:87",
     "int": "8e:e8:02:3a:00:f9",
@@ -54,15 +43,22 @@ INTERFACE_MAP = {
     "enp0s2": "ext",   # external network (host only)
     "enp0s3": "dmz",   # DMZ (host only) - add adapter in UTM when ready
     "enp0s4": "mgt",   # management (host only) - add adapter in UTM when ready
-    "lo":     "mgt",   # loopback treated as management
 }
 
 # Map physical interface names for sending replies
-IFACE_SEND = {
+IFACE_NAMES = {
     "int": "enp0s1",
     "ext": "enp0s2",
     "dmz": "enp0s3",
     "mgt": "enp0s4",
+}
+
+# Map network addresses to logical interface names (used by RouteTable)
+IFACE_NETWORKS = {
+    "192.168.58.0": "mgt",
+    "192.168.64.0": "int",
+    "192.168.57.0": "dmz",
+    "192.168.56.0": "ext",
 }
 
 
@@ -83,35 +79,26 @@ class Interface:
     def set_mask(self, mask): self.mask = mask
 
     def send_packet(self, packet):
-        iface = IFACE_SEND.get(self.name)
+        iface = IFACE_NAMES.get(self.name)
         if iface:
-            try:
-                sendp(packet, iface=iface, verbose=False)
-            except (ValueError, OSError):
-                pass  # interface not available when running locally
+            sendp(packet, iface=iface, verbose=False)
+
 
 
 # ------------------- InterfaceHandler -------------------
 
 class InterfaceHandler:
     def __init__(self):
-        self.mgt = Interface("mgt", _read_mac("enp0s4", "ee:21:c0:9c:80:87"), "255.255.255.0", _read_ip("enp0s4", "192.168.58.2"))
-        self.int = Interface("int", _read_mac("enp0s1", "8e:e8:02:3a:00:f9"), "255.255.255.0", _read_ip("enp0s1", "192.168.64.2"))
-        self.dmz = Interface("dmz", _read_mac("enp0s3", "46:49:15:3d:47:15"), "255.255.255.0", _read_ip("enp0s3", "192.168.57.2"))
-        self.ext = Interface("ext", _read_mac("enp0s2", "a6:6a:20:d1:68:d4"), "255.255.255.0", _read_ip("enp0s2", "192.168.56.2"))
+        self.mgt = Interface("mgt", get_if_hwaddr(IFACE_NAMES.get("mgt")), "255.255.255.0", get_if_addr(IFACE_NAMES.get("mgt")))
+        self.int = Interface("int", get_if_hwaddr(IFACE_NAMES.get("int")), "255.255.255.0", get_if_addr(IFACE_NAMES.get("int")))
+        self.dmz = Interface("dmz", get_if_hwaddr(IFACE_NAMES.get("dmz")), "255.255.255.0", get_if_addr(IFACE_NAMES.get("dmz")))
+        self.ext = Interface("ext", get_if_hwaddr(IFACE_NAMES.get("ext")), "255.255.255.0", get_if_addr(IFACE_NAMES.get("ext")))
 
+        # set macs
         STR_MACS["mgt"] = self.mgt.get_mac()
         STR_MACS["int"] = self.int.get_mac()
         STR_MACS["dmz"] = self.dmz.get_mac()
         STR_MACS["ext"] = self.ext.get_mac()
-
-        # Used by RouteTable to resolve egress interface from dest IP
-        self.IFACE_NETWORKS = {
-            "192.168.58.0": "mgt",
-            "192.168.64.0": "int",
-            "192.168.57.0": "dmz",
-            "192.168.56.0": "ext",
-        }
 
     def send_packet(self, interface: str, packet):
         if interface == "mgt":
@@ -124,7 +111,7 @@ class InterfaceHandler:
             self.ext.send_packet(packet)
 
     def mgt_packet(self, packet):
-        print(f"ROUTE mgt (management) | {format_packet(packet)}")
+        print(f"ROUTE mgt | {format_packet(packet)}")
 
     def get_int_interface(self): return self.int
     def get_dmz_interface(self): return self.dmz
@@ -198,17 +185,14 @@ class Connections:
 # --------------------- RouteTable ---------------------
 
 class RouteTable:
-    def __init__(self, ih: InterfaceHandler):
-        self.ih = ih
-        # Masks in descending prefix length order (longest prefix match)
+    def __init__(self):
         self.MASKS = [0xffffff00, 0xffff0000, 0xfffff000]
 
     def resolve(self, ip: str) -> str:
-        """Return egress interface name for a destination IP (longest-prefix match)."""
         ip_int = ip_to_int(ip)
         for mask in self.MASKS:
             network_ip = int_to_ip(ip_int & mask)
-            interface = self.ih.IFACE_NETWORKS.get(network_ip)
+            interface = IFACE_NETWORKS.get(network_ip)
             if interface is not None:
                 return interface
         return "ext"
@@ -219,7 +203,7 @@ class RouteTable:
 class PacketEngine:
     def __init__(self, ih: InterfaceHandler):
         self.ih = ih
-        self.rt = RouteTable(ih)
+        self.rt = RouteTable()
         self.pt = PatTable()
         self.connections = Connections()
         self.ping_window = 0
