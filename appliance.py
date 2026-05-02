@@ -779,18 +779,24 @@ def main():
 
     def handle(pkt):
         try:
+            # Skips non-IP packets like ARP, the appliance doesn't handle it
             if IP not in pkt:
                 return
+            # Prevents feedback loop since sniff reads all packets even the ones this appliance sends
             if pkt[IP].src in own_ips:
                 return
+            # get interface the packet arrived on
             iface = getattr(pkt, "sniffed_on", None)
             ingress = INTERFACE_MAP.get(iface, "ext")
+            # check the packet
             pe.process_packet(pkt, ingress)
         except Exception as e:
             print(f"Error processing packet: {e}")
 
-    own_ip_list = list(own_ips)
-    bpf = "not port 22 and not src host " + " and not src host ".join(own_ip_list)
+    # exclude SSH to the management IP only (protects the admin session without blocking transit SSH)
+    # exclude packets from the appliance's own IPs to avoid processing outgoing traffic
+    mgt_ip = ih.mgt.get_ip()
+    bpf = f"not (port {SSH_PORT} and dst host {mgt_ip}) and not src host " + " and not src host ".join(own_ips)
     sniff(prn=handle, store=False, iface=list(INTERFACE_MAP.keys()), filter=bpf)
 
 
