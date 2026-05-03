@@ -24,8 +24,9 @@ def format_packet(pkt):
 
 # ICMP policy
 MAX_ICMP_PAYLOAD_BYTES = 64
-MAX_PING_WINDOW        = 5
-IP_HEADER_SIZE         = 20
+MAX_PING_WINDOW = 5
+IP_HEADER_SIZE = 20
+ECHO_REQUEST = 8
 
 # TCP policy
 MAX_INCOMPLETE_CONNECTIONS = 100
@@ -264,6 +265,12 @@ class RouteTable:
 # --------------------- PacketEngine --------------------
 
 class PacketEngine:
+    """
+    Core firewall engine. Responsible for parsing, inspecting, and routing packets.
+    Maintains state across packets via the connection table (Connections),
+    PAT translation table (PatTable), and ping rate-limiting counters.
+    """
+
     def __init__(self, ih: InterfaceHandler):
         self.ih = ih
         self.rt = RouteTable()
@@ -277,7 +284,7 @@ class PacketEngine:
     # -------------------- Parsing --------------------
 
     def parse_packet(self, pkt, ingress: str) -> dict:
-        """Parse a Scapy packet into a flat info dictionary."""
+        """Parse a Scapy packet into a dictionary."""
         info = {}
         info["ingress"] = ingress
         info["src_mac"] = pkt[Ether].src if Ether in pkt else "00:00:00:00:00:00"
@@ -287,7 +294,7 @@ class PacketEngine:
         info["dest_ip"] = pkt[IP].dst
         info["egress"] = self.rt.resolve(info["dest_ip"])
 
-        # Defaults so all keys always exist
+        # defaults so all keys always exist
         info["src_port"] = 0
         info["dest_port"] = 0
         info["flags"] = 0
@@ -309,7 +316,7 @@ class PacketEngine:
             info["bytes"] = len(bytes(pkt[IP]))
 
         if TCP in pkt:
-            # Silently strip URG and PSH flags per policy
+            # Silently strip URG and PSH flags
             raw_flags = int(pkt[TCP].flags)
             info["flags"] = raw_flags & ~(FLAG_MASKS["URG"] | FLAG_MASKS["PSH"])
             info["src_port"] = pkt[TCP].sport
@@ -328,7 +335,7 @@ class PacketEngine:
     # -------------------- Packet construction --------------------
 
     def create_echo_reply(self, p: dict):
-        """Build an ICMP echo reply from a parsed echo request."""
+        """Build an ICMP echo reply"""
         reply = (
             Ether(src=p["dest_mac"], dst=p["src_mac"]) /
             IP(src=p["dest_ip"], dst=p["src_ip"]) /
@@ -340,7 +347,7 @@ class PacketEngine:
 
     def create_reply(self, dest_mac, src_mac, proto, src_ip, dest_ip,
                      src_port, dest_port, seq, ack, flags, payload):
-        """Build a TCP or UDP reply packet."""
+        """Build a TCP or UDP reply packet"""
         eth = Ether(src=src_mac, dst=dest_mac)
         ip  = IP(src=src_ip, dst=dest_ip)
         if proto == PROTO_TCP:
@@ -353,6 +360,21 @@ class PacketEngine:
         return pkt
 
     # -------------------- Security checks --------------------
+    def check_ICMP(self, p) -> bool:
+        if p["type"] == ECHO_REQUEST:  
+            if p["bytes"] - IP_HEADER_SIZE > MAX_ICMP_PAYLOAD_BYTES:
+                print(f"ALERT drop: oversize ping from {p['src_ip']} ({int(p['bytes'])} bytes)")
+                return False
+            if self.ping_window >= MAX_PING_WINDOW:
+                print(f"ALERT drop: ping rate limit from {p['src_ip']}")
+                return False
+            self.ping_window += 1
+            self.non_ping = 0
+            return True
+        else:
+            self.non_ping += 1
+            print(f"ALERT drop: ICMP type {p['type']}:{p['code']} not allowed by policy")
+            return False
 
     def check_packet(self) -> bool:
         """Return True if the packet is allowed by policy, False to drop."""
@@ -360,20 +382,7 @@ class PacketEngine:
 
         # --- ICMP ---
         if p["protocol"] == PROTO_ICMP:
-            if p["type"] == 8:  # echo-request
-                if p["bytes"] - IP_HEADER_SIZE > MAX_ICMP_PAYLOAD_BYTES:
-                    print(f"ALERT drop: oversize ping from {p['src_ip']} ({int(p['bytes'])} bytes)")
-                    return False
-                if self.ping_window >= MAX_PING_WINDOW:
-                    print(f"ALERT drop: ping rate limit from {p['src_ip']}")
-                    return False
-                self.ping_window += 1
-                self.non_ping = 0
-                return True
-            else:
-                self.non_ping += 1
-                print(f"ALERT drop: ICMP type {p['type']}:{p['code']} not allowed by policy")
-                return False
+            return self.check_ICMP(p)
 
         # Non-ICMP packet resets ping window tracking
         self.non_ping += 1
@@ -389,10 +398,7 @@ class PacketEngine:
             return True
 
         # Allow SYN-ACK or ACK for in-progress handshakes
-        if state == "syn_sent" and p["flags"] in (
-            FLAG_MASKS["SYN"] | FLAG_MASKS["ACK"],  # 18 = SYN-ACK
-            FLAG_MASKS["ACK"]                        # 16 = ACK
-        ):
+        if state == "syn_sent" and p["flags"] in (FLAG_MASKS["SYN"] | FLAG_MASKS["ACK"],  FLAG_MASKS["ACK"]):
             return True
 
         # --- TCP-specific checks ---
@@ -462,117 +468,131 @@ class PacketEngine:
     # -------------------- TCP/UDP routing --------------------
 
     def handle_TCP_UDP(self):
-        """Route an allowed TCP/UDP packet and return the forwarded packet."""
+        """Dispatch an allowed TCP/UDP packet to the correct handler."""
         p = self.curr_packet
-        state = self.connections.state(
+
+        if p["ingress"] in ("int", "dmz") and p["dest_port"] == DNS_PORT and p["egress"] == "ext":
+            return self.handle_dns_outbound()
+        if p["ingress"] == "int" and p["dest_port"] in (HTTP_PORT, HTTPS_PORT):
+            return self.handle_int_http()
+        if p["ingress"] == "int" and p["dest_port"] == SSH_PORT:
+            return self.handle_int_ssh_outbound()
+        if p["ingress"] == "int" and p["src_port"] == SSH_PORT and p["egress"] == "dmz":
+            return self.handle_int_ssh_reply()
+        if p["ingress"] == "dmz" and p["src_port"] in (HTTP_PORT, HTTPS_PORT):
+            return self.handle_dmz_http_reply()
+        if p["ingress"] == "dmz" and p["src_port"] == SSH_PORT:
+            return self.handle_dmz_ssh_reply()
+        if p["ingress"] == "dmz" and p["dest_port"] == SSH_PORT and p["egress"] == "int":
+            return self.handle_dmz_ssh_to_int()
+        if p["ingress"] == "ext" and p["dest_port"] == SSH_PORT:
+            return self.handle_ext_ssh_inbound()
+        if p["ingress"] == "ext" and p["src_port"] == SSH_PORT:
+            return self.handle_ext_ssh_reply()
+        if p["ingress"] == "ext" and p["dest_port"] in (HTTP_PORT, HTTPS_PORT):
+            return self.handle_ext_http_inbound()
+        if p["ingress"] == "ext" and p["src_port"] in (HTTP_PORT, HTTPS_PORT):
+            return self.handle_ext_http_reply()
+        if p["ingress"] == "ext" and p["src_port"] == DNS_PORT:
+            return self.handle_ext_dns_reply()
+
+        return None
+
+    def state(self):
+        """Return the current connection state for the packet being processed."""
+        p = self.curr_packet
+        return self.connections.state(
             p["ingress"], p["protocol"],
             p["src_ip"], p["src_port"],
             p["dest_ip"], p["dest_port"]
         )
 
-        # ---- int or dmz → ext DNS (with PAT) ----
-        if p["ingress"] in ("int", "dmz") and p["dest_port"] == DNS_PORT and p["egress"] == "ext":
-            if state is None:
-                new_state = "syn_sent" if (p["protocol"] == PROTO_TCP and p["flags"] == FLAG_MASKS["SYN"]) else "established"
-                if new_state == "syn_sent":
-                    self.incomplete_num += 1
+    def handle_dns_outbound(self):
+        """int or dmz → ext DNS query with PAT."""
+        p = self.curr_packet
+        state = self.state()
+        if state is None:
+            new_state = "syn_sent" if (p["protocol"] == PROTO_TCP and p["flags"] == FLAG_MASKS["SYN"]) else "established"
+            if new_state == "syn_sent":
+                self.incomplete_num += 1
+            out_port = self.pt.get_unused_port()
+            self.pt.set_pat(p["src_ip"], p["src_port"], out_port)
+            self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], DNS_PORT, "130.102.184.1", out_port, new_state)
+            self.connections.add_or_update(p["ingress"], p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], DNS_PORT, new_state)
+        elif state == "syn_sent" and p["protocol"] == PROTO_TCP and p["flags"] == FLAG_MASKS["ACK"]:
+            self.incomplete_num -= 1
+            out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
+            self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], DNS_PORT, "130.102.184.1", out_port, "established")
+            self.connections.add_or_update(p["ingress"], p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], DNS_PORT, "established")
+        out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
+        return self.create_reply(
+            p["src_mac"], STR_MACS["ext"], p["protocol"],
+            "130.102.184.1", p["dest_ip"],
+            out_port, p["dest_port"],
+            p["seq"], p["ack"], p["flags"], p["payload"]
+        )
+
+    def handle_int_http(self):
+        """int → HTTP/HTTPS outbound to ext or dmz."""
+        p = self.curr_packet
+        state = self.state()
+        new_state = "established"
+        if state is None:
+            if p["flags"] == FLAG_MASKS["SYN"]:
+                self.incomplete_num += 1
+                new_state = "syn_sent"
+            if p["egress"] == "ext":
                 out_port = self.pt.get_unused_port()
                 self.pt.set_pat(p["src_ip"], p["src_port"], out_port)
-                self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], DNS_PORT, "130.102.184.1", out_port, new_state)
-                self.connections.add_or_update(p["ingress"], p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], DNS_PORT, new_state)
-            elif state == "syn_sent" and p["protocol"] == PROTO_TCP and p["flags"] == FLAG_MASKS["ACK"]:
-                self.incomplete_num -= 1
-                out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
-                self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], DNS_PORT, "130.102.184.1", out_port, "established")
-                self.connections.add_or_update(p["ingress"], p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], DNS_PORT, "established")
-
+        elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
+            self.incomplete_num -= 1
+        if p["egress"] == "ext":
             out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
+            self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], p["dest_port"], "130.102.184.1", out_port, new_state)
+            self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], p["dest_port"], new_state)
             return self.create_reply(
-                p["src_mac"], STR_MACS["ext"], p["protocol"],
+                p["dest_mac"], STR_MACS["ext"], p["protocol"],
                 "130.102.184.1", p["dest_ip"],
                 out_port, p["dest_port"],
                 p["seq"], p["ack"], p["flags"], p["payload"]
             )
+        elif p["egress"] == "dmz":
+            self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], p["dest_port"], p["src_ip"], p["src_port"], new_state)
+            self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], p["dest_port"], new_state)
+            return self.create_reply(
+                p["dest_mac"], STR_MACS["dmz"], p["protocol"],
+                p["src_ip"], p["dest_ip"],
+                p["src_port"], p["dest_port"],
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
 
-        # ---- int → HTTP/HTTPS ----
-        if p["ingress"] == "int" and p["dest_port"] in (HTTP_PORT, HTTPS_PORT):
-            new_state = "established"
-            if state is None:
-                if p["flags"] == FLAG_MASKS["SYN"]:
-                    self.incomplete_num += 1
-                    new_state = "syn_sent"
-                if p["egress"] == "ext":
-                    out_port = self.pt.get_unused_port()
-                    self.pt.set_pat(p["src_ip"], p["src_port"], out_port)
+    def handle_int_ssh_outbound(self):
+        """int → SSH outbound to ext (with PAT) or dmz (no PAT)."""
+        p = self.curr_packet
+        state = self.state()
+        if p["egress"] == "ext":
+            if state is None and p["flags"] == FLAG_MASKS["SYN"]:
+                self.incomplete_num += 1
+                out_port = self.pt.get_unused_port()
+                self.pt.set_pat(p["src_ip"], p["src_port"], out_port)
+                self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], SSH_PORT, "130.102.184.1", out_port, "syn_sent")
+                self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], SSH_PORT, "syn_sent")
             elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
                 self.incomplete_num -= 1
-
-            if p["egress"] == "ext":
                 out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
-                self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], p["dest_port"], "130.102.184.1", out_port, new_state)
-                self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], p["dest_port"], new_state)
-                return self.create_reply(
-                    p["dest_mac"], STR_MACS["ext"], p["protocol"],
-                    "130.102.184.1", p["dest_ip"],
-                    out_port, p["dest_port"],
-                    p["seq"], p["ack"], p["flags"], p["payload"]
-                )
-            elif p["egress"] == "dmz":
-                self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], p["dest_port"], p["src_ip"], p["src_port"], new_state)
-                self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], p["dest_port"], new_state)
-                return self.create_reply(
-                    p["dest_mac"], STR_MACS["dmz"], p["protocol"],
-                    p["src_ip"], p["dest_ip"],
-                    p["src_port"], p["dest_port"],
-                    p["seq"], p["ack"], p["flags"], p["payload"]
-                )
-
-        # ---- int → SSH (outbound to ext or dmz) ----
-        if p["ingress"] == "int" and p["dest_port"] == SSH_PORT:
-            if p["egress"] == "ext":
-                if state is None and p["flags"] == FLAG_MASKS["SYN"]:
-                    self.incomplete_num += 1
-                    out_port = self.pt.get_unused_port()
-                    self.pt.set_pat(p["src_ip"], p["src_port"], out_port)
-                    self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], SSH_PORT, "130.102.184.1", out_port, "syn_sent")
-                    self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], SSH_PORT, "syn_sent")
-                elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
-                    self.incomplete_num -= 1
-                    out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
-                    self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], SSH_PORT, "130.102.184.1", out_port, "established")
-                    self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], SSH_PORT, "established")
-                elif state != "established":
-                    print("ALERT drop: new incoming TCP not allowed by policy")
-                    return None
-                out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
-                return self.create_reply(
-                    p["src_mac"], STR_MACS["ext"], p["protocol"],
-                    "130.102.184.1", p["dest_ip"],
-                    out_port, SSH_PORT,
-                    p["seq"], p["ack"], p["flags"], p["payload"]
-                )
-
-            if p["egress"] == "dmz":
-                new_state = "syn_sent"
-                if state is None:
-                    if p["flags"] != FLAG_MASKS["SYN"]:
-                        print("ALERT drop: new incoming TCP not allowed by policy")
-                        return None
-                    self.incomplete_num += 1
-                elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
-                    self.incomplete_num -= 1
-                    new_state = "established"
-                self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], SSH_PORT, p["src_ip"], p["src_port"], new_state)
-                self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], SSH_PORT, new_state)
-                return self.create_reply(
-                    p["dest_mac"], STR_MACS["dmz"], p["protocol"],
-                    p["src_ip"], p["dest_ip"],
-                    p["src_port"], SSH_PORT,
-                    p["seq"], p["ack"], p["flags"], p["payload"]
-                )
-
-        # ---- int SSH reply from dmz (src_port == 22) ----
-        if p["ingress"] == "int" and p["src_port"] == SSH_PORT and p["egress"] == "dmz":
+                self.connections.add_or_update("ext", p["protocol"], p["dest_ip"], SSH_PORT, "130.102.184.1", out_port, "established")
+                self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], SSH_PORT, "established")
+            elif state != "established":
+                print("ALERT drop: new incoming TCP not allowed by policy")
+                return None
+            out_port = self.pt.get_pat_out(p["src_ip"], p["src_port"])
+            return self.create_reply(
+                p["src_mac"], STR_MACS["ext"], p["protocol"],
+                "130.102.184.1", p["dest_ip"],
+                out_port, SSH_PORT,
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
+        if p["egress"] == "dmz":
             new_state = "syn_sent"
             if state is None:
                 if p["flags"] != FLAG_MASKS["SYN"]:
@@ -582,157 +602,190 @@ class PacketEngine:
             elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
                 self.incomplete_num -= 1
                 new_state = "established"
-            self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], p["dest_port"], p["src_ip"], SSH_PORT, new_state)
-            self.connections.add_or_update("int", p["protocol"], p["src_ip"], SSH_PORT, p["dest_ip"], p["dest_port"], new_state)
+            self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], SSH_PORT, p["src_ip"], p["src_port"], new_state)
+            self.connections.add_or_update("int", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], SSH_PORT, new_state)
             return self.create_reply(
                 p["dest_mac"], STR_MACS["dmz"], p["protocol"],
+                p["src_ip"], p["dest_ip"],
+                p["src_port"], SSH_PORT,
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
+
+    def handle_int_ssh_reply(self):
+        """int receiving SSH reply from dmz."""
+        p = self.curr_packet
+        state = self.state()
+        new_state = "syn_sent"
+        if state is None:
+            if p["flags"] != FLAG_MASKS["SYN"]:
+                print("ALERT drop: new incoming TCP not allowed by policy")
+                return None
+            self.incomplete_num += 1
+        elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
+            self.incomplete_num -= 1
+            new_state = "established"
+        self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], p["dest_port"], p["src_ip"], SSH_PORT, new_state)
+        self.connections.add_or_update("int", p["protocol"], p["src_ip"], SSH_PORT, p["dest_ip"], p["dest_port"], new_state)
+        return self.create_reply(
+            p["dest_mac"], STR_MACS["dmz"], p["protocol"],
+            p["src_ip"], p["dest_ip"],
+            SSH_PORT, p["dest_port"],
+            p["seq"], p["ack"], p["flags"], p["payload"]
+        )
+
+    def handle_dmz_http_reply(self):
+        """dmz web proxy replying to HTTP/HTTPS request."""
+        p = self.curr_packet
+        state = self.state()
+        if state is None:
+            return None
+        if state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
+            self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], p["dest_port"], p["src_ip"], p["src_port"], "established")
+            self.connections.add_or_update(p["egress"], p["protocol"], p["dest_ip"], p["dest_port"], p["src_ip"], p["src_port"], "established")
+        src_ip = "130.102.184.1" if p["egress"] == "ext" else p["src_ip"]
+        return self.create_reply(
+            p["dest_mac"], STR_MACS[p["egress"]], p["protocol"],
+            src_ip, p["dest_ip"],
+            p["src_port"], p["dest_port"],
+            p["seq"], p["ack"], p["flags"], p["payload"]
+        )
+
+    def handle_dmz_ssh_reply(self):
+        """dmz jump box replying to SSH (back to ext or int)."""
+        p = self.curr_packet
+        state = self.state()
+        if state is None:
+            print("ALERT drop: new incoming TCP not allowed by policy")
+            return None
+        if p["egress"] == "ext":
+            return self.create_reply(
+                p["dest_mac"], STR_MACS["ext"], p["protocol"],
+                "130.102.184.1", p["dest_ip"],
+                SSH_PORT, p["dest_port"],
+                p["seq"], p["ack"], p["flags"], p["payload"]
+            )
+        if p["egress"] == "int":
+            return self.create_reply(
+                p["dest_mac"], STR_MACS["int"], p["protocol"],
                 p["src_ip"], p["dest_ip"],
                 SSH_PORT, p["dest_port"],
                 p["seq"], p["ack"], p["flags"], p["payload"]
             )
 
-        # ---- dmz → HTTP/HTTPS replies ----
-        if p["ingress"] == "dmz" and p["src_port"] in (HTTP_PORT, HTTPS_PORT):
-            if state is None:
-                return None
-            if state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
-                self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], p["dest_port"], p["src_ip"], p["src_port"], "established")
-                self.connections.add_or_update(p["egress"], p["protocol"], p["dest_ip"], p["dest_port"], p["src_ip"], p["src_port"], "established")
-            src_ip = "130.102.184.1" if p["egress"] == "ext" else p["src_ip"]
-            return self.create_reply(
-                p["dest_mac"], STR_MACS[p["egress"]], p["protocol"],
-                src_ip, p["dest_ip"],
-                p["src_port"], p["dest_port"],
-                p["seq"], p["ack"], p["flags"], p["payload"]
-            )
-
-        # ---- dmz → SSH replies (back to ext or int) ----
-        if p["ingress"] == "dmz" and p["src_port"] == SSH_PORT:
-            if state is None:
+    def handle_dmz_ssh_to_int(self):
+        """dmz jump box initiating SSH to int."""
+        p = self.curr_packet
+        state = self.state()
+        new_state = "syn_sent"
+        if state is None:
+            if p["flags"] != FLAG_MASKS["SYN"]:
                 print("ALERT drop: new incoming TCP not allowed by policy")
                 return None
-            if p["egress"] == "ext":
-                return self.create_reply(
-                    p["dest_mac"], STR_MACS["ext"], p["protocol"],
-                    "130.102.184.1", p["dest_ip"],
-                    SSH_PORT, p["dest_port"],
-                    p["seq"], p["ack"], p["flags"], p["payload"]
-                )
-            if p["egress"] == "int":
-                return self.create_reply(
-                    p["dest_mac"], STR_MACS["int"], p["protocol"],
-                    p["src_ip"], p["dest_ip"],
-                    SSH_PORT, p["dest_port"],
-                    p["seq"], p["ack"], p["flags"], p["payload"]
-                )
-
-        # ---- dmz jump box → int SSH ----
-        if p["ingress"] == "dmz" and p["dest_port"] == SSH_PORT and p["egress"] == "int":
-            new_state = "syn_sent"
-            if state is None:
-                if p["flags"] != FLAG_MASKS["SYN"]:
-                    print("ALERT drop: new incoming TCP not allowed by policy")
-                    return None
-                self.incomplete_num += 1
-            elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
-                self.incomplete_num -= 1
-                new_state = "established"
-            self.connections.add_or_update("int", p["protocol"], p["dest_ip"], SSH_PORT, p["src_ip"], p["src_port"], new_state)
-            self.connections.add_or_update("dmz", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], SSH_PORT, new_state)
-            return self.create_reply(
-                p["dest_mac"], STR_MACS["int"], p["protocol"],
-                p["src_ip"], p["dest_ip"],
-                p["src_port"], SSH_PORT,
-                p["seq"], p["ack"], p["flags"], p["payload"]
-            )
-
-        # ---- ext → SSH → dmz jump box ----
-        if p["ingress"] == "ext" and p["dest_port"] == SSH_PORT:
-            new_state = "syn_sent"
-            if state is None:
-                if p["flags"] != FLAG_MASKS["SYN"]:
-                    print("ALERT drop: new incoming TCP not allowed by policy")
-                    return None
-                self.incomplete_num += 1
-            elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
-                self.incomplete_num -= 1
-                new_state = "established"
-            p["egress"] = "dmz"
-            p["dest_ip"] = DMZ_JUMP_BOX
-            self.connections.add_or_update("ext", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], SSH_PORT, new_state)
-            self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], SSH_PORT, p["src_ip"], p["src_port"], new_state)
-            return self.create_reply(
-                p["src_mac"], STR_MACS["dmz"], p["protocol"],
-                p["src_ip"], DMZ_JUMP_BOX,
-                p["src_port"], SSH_PORT,
-                p["seq"], p["ack"], p["flags"], p["payload"]
-            )
-
-        # ---- ext → SSH reply back via PAT ----
-        if p["ingress"] == "ext" and p["src_port"] == SSH_PORT:
-            dest_ip, dest_port = self.pt.get_pat_in_actual(p["dest_port"])
-            if dest_ip is None:
-                print("ALERT drop: new incoming TCP not allowed by policy")
-                return None
-            egress = self.rt.resolve(dest_ip)
-            return self.create_reply(
-                p["dest_mac"], STR_MACS[egress], p["protocol"],
-                p["src_ip"], dest_ip,
-                SSH_PORT, dest_port,
-                p["seq"], p["ack"], p["flags"], p["payload"]
-            )
-
-        # ---- ext → HTTP/HTTPS → dmz web proxy ----
-        if p["ingress"] == "ext" and p["dest_port"] in (HTTP_PORT, HTTPS_PORT):
+            self.incomplete_num += 1
+        elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
+            self.incomplete_num -= 1
             new_state = "established"
-            if state is None:
-                if p["protocol"] == PROTO_TCP and p["flags"] == FLAG_MASKS["SYN"]:
-                    self.incomplete_num += 1
-                    new_state = "syn_sent"
-            elif state == "syn_sent":
-                if p["protocol"] == PROTO_TCP and p["flags"] == FLAG_MASKS["ACK"]:
-                    self.incomplete_num -= 1
-                    new_state = "established"
-                else:
-                    new_state = "syn_sent"
-            self.connections.add_or_update("ext", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], p["dest_port"], new_state)
-            p["egress"] = "dmz"
-            p["dest_ip"] = DMZ_WEB_PROXY
-            self.connections.add_or_update("dmz", p["protocol"], DMZ_WEB_PROXY, p["dest_port"], p["src_ip"], p["src_port"], new_state)
-            return self.create_reply(
-                p["src_mac"], STR_MACS["dmz"], p["protocol"],
-                p["src_ip"], DMZ_WEB_PROXY,
-                p["src_port"], p["dest_port"],
-                p["seq"], p["ack"], p["flags"], p["payload"]
-            )
+        self.connections.add_or_update("int", p["protocol"], p["dest_ip"], SSH_PORT, p["src_ip"], p["src_port"], new_state)
+        self.connections.add_or_update("dmz", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], SSH_PORT, new_state)
+        return self.create_reply(
+            p["dest_mac"], STR_MACS["int"], p["protocol"],
+            p["src_ip"], p["dest_ip"],
+            p["src_port"], SSH_PORT,
+            p["seq"], p["ack"], p["flags"], p["payload"]
+        )
 
-        # ---- ext → HTTP/HTTPS reply via PAT ----
-        if p["ingress"] == "ext" and p["src_port"] in (HTTP_PORT, HTTPS_PORT):
-            dest_ip, dest_port = self.pt.get_pat_in_actual(p["dest_port"])
-            if dest_ip is None:
+    def handle_ext_ssh_inbound(self):
+        """ext → SSH inbound, routed to dmz jump box."""
+        p = self.curr_packet
+        state = self.state()
+        new_state = "syn_sent"
+        if state is None:
+            if p["flags"] != FLAG_MASKS["SYN"]:
+                print("ALERT drop: new incoming TCP not allowed by policy")
                 return None
-            egress = self.rt.resolve(dest_ip)
-            return self.create_reply(
-                p["dest_mac"], STR_MACS[egress], p["protocol"],
-                p["src_ip"], dest_ip,
-                p["src_port"], dest_port,
-                p["seq"], p["ack"], p["flags"], p["payload"]
-            )
+            self.incomplete_num += 1
+        elif state == "syn_sent" and p["flags"] == FLAG_MASKS["ACK"]:
+            self.incomplete_num -= 1
+            new_state = "established"
+        p["egress"] = "dmz"
+        p["dest_ip"] = DMZ_JUMP_BOX
+        self.connections.add_or_update("ext", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], SSH_PORT, new_state)
+        self.connections.add_or_update("dmz", p["protocol"], p["dest_ip"], SSH_PORT, p["src_ip"], p["src_port"], new_state)
+        return self.create_reply(
+            p["src_mac"], STR_MACS["dmz"], p["protocol"],
+            p["src_ip"], DMZ_JUMP_BOX,
+            p["src_port"], SSH_PORT,
+            p["seq"], p["ack"], p["flags"], p["payload"]
+        )
 
-        # ---- ext → DNS reply via PAT ----
-        if p["ingress"] == "ext" and p["src_port"] == DNS_PORT:
-            dest_ip, dest_port = self.pt.get_pat_in_actual(p["dest_port"])
-            if dest_ip is None:
-                return None
-            egress = self.rt.resolve(dest_ip)
-            return self.create_reply(
-                p["src_mac"], STR_MACS[egress], p["protocol"],
-                p["src_ip"], dest_ip,
-                DNS_PORT, dest_port,
-                p["seq"], p["ack"], p["flags"], p["payload"]
-            )
+    def handle_ext_ssh_reply(self):
+        """ext SSH reply routed back to internal host via PAT."""
+        p = self.curr_packet
+        dest_ip, dest_port = self.pt.get_pat_in_actual(p["dest_port"])
+        if dest_ip is None:
+            print("ALERT drop: new incoming TCP not allowed by policy")
+            return None
+        egress = self.rt.resolve(dest_ip)
+        return self.create_reply(
+            p["dest_mac"], STR_MACS[egress], p["protocol"],
+            p["src_ip"], dest_ip,
+            SSH_PORT, dest_port,
+            p["seq"], p["ack"], p["flags"], p["payload"]
+        )
 
-        return None
+    def handle_ext_http_inbound(self):
+        """ext → HTTP/HTTPS inbound, routed to dmz web proxy."""
+        p = self.curr_packet
+        state = self.state()
+        new_state = "established"
+        if state is None:
+            if p["protocol"] == PROTO_TCP and p["flags"] == FLAG_MASKS["SYN"]:
+                self.incomplete_num += 1
+                new_state = "syn_sent"
+        elif state == "syn_sent":
+            if p["protocol"] == PROTO_TCP and p["flags"] == FLAG_MASKS["ACK"]:
+                self.incomplete_num -= 1
+                new_state = "established"
+            else:
+                new_state = "syn_sent"
+        self.connections.add_or_update("ext", p["protocol"], p["src_ip"], p["src_port"], p["dest_ip"], p["dest_port"], new_state)
+        p["egress"] = "dmz"
+        p["dest_ip"] = DMZ_WEB_PROXY
+        self.connections.add_or_update("dmz", p["protocol"], DMZ_WEB_PROXY, p["dest_port"], p["src_ip"], p["src_port"], new_state)
+        return self.create_reply(
+            p["src_mac"], STR_MACS["dmz"], p["protocol"],
+            p["src_ip"], DMZ_WEB_PROXY,
+            p["src_port"], p["dest_port"],
+            p["seq"], p["ack"], p["flags"], p["payload"]
+        )
+
+    def handle_ext_http_reply(self):
+        """ext HTTP/HTTPS reply routed back to internal host via PAT."""
+        p = self.curr_packet
+        dest_ip, dest_port = self.pt.get_pat_in_actual(p["dest_port"])
+        if dest_ip is None:
+            return None
+        egress = self.rt.resolve(dest_ip)
+        return self.create_reply(
+            p["dest_mac"], STR_MACS[egress], p["protocol"],
+            p["src_ip"], dest_ip,
+            p["src_port"], dest_port,
+            p["seq"], p["ack"], p["flags"], p["payload"]
+        )
+
+    def handle_ext_dns_reply(self):
+        """ext DNS reply routed back to internal host via PAT."""
+        p = self.curr_packet
+        dest_ip, dest_port = self.pt.get_pat_in_actual(p["dest_port"])
+        if dest_ip is None:
+            return None
+        egress = self.rt.resolve(dest_ip)
+        return self.create_reply(
+            p["src_mac"], STR_MACS[egress], p["protocol"],
+            p["src_ip"], dest_ip,
+            DNS_PORT, dest_port,
+            p["seq"], p["ack"], p["flags"], p["payload"]
+        )
 
     # -------------------- Main processing --------------------
 
@@ -793,10 +846,9 @@ def main():
         except Exception as e:
             print(f"Error processing packet: {e}")
 
-    # exclude SSH to the management IP only (protects the admin session without blocking transit SSH)
-    # exclude packets from the appliance's own IPs to avoid processing outgoing traffic
-    mgt_ip = ih.mgt.get_ip()
-    bpf = f"not (port {SSH_PORT} and dst host {mgt_ip}) and not src host " + " and not src host ".join(own_ips)
+    own_ip_list = list(own_ips)
+    # filter packets
+    bpf = "not port 22 and not src host " + " and not src host ".join(own_ip_list)
     sniff(prn=handle, store=False, iface=list(INTERFACE_MAP.keys()), filter=bpf)
 
 
