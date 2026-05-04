@@ -12,10 +12,11 @@ DMZ_PHYS = "enp0s3"
 MGT_PHYS = "enp0s4"
 
 # Subnet prefixes
-INT_SUBNET = "192.168.64"
-EXT_SUBNET = "192.168.56"
-DMZ_SUBNET = "192.168.57"
-MGT_SUBNET = "192.168.58"
+INT_SUBNET      = "192.168.64"
+EXT_SUBNET      = "192.168.56"
+DMZ_SUBNET      = "192.168.57"
+MGT_SUBNET      = "192.168.58"
+DMZ_HOST_SUBNET = "10.1.0"
 
 # Map physical interface names to logical interface names
 INTERFACE_MAP = {
@@ -35,10 +36,11 @@ IFACE_NAMES = {
 
 # Map network addresses to the logical interface that owns that subnet
 IFACE_NETWORKS = {
-    f"{INT_SUBNET}.0": "int",
-    f"{EXT_SUBNET}.0": "ext",
-    f"{DMZ_SUBNET}.0": "dmz",
-    f"{MGT_SUBNET}.0": "mgt",
+    f"{INT_SUBNET}.0":      "int",
+    f"{EXT_SUBNET}.0":      "ext",
+    f"{DMZ_SUBNET}.0":      "dmz",
+    f"{DMZ_HOST_SUBNET}.0": "dmz",
+    f"{MGT_SUBNET}.0":      "mgt",
 }
 
 # Interface addresses

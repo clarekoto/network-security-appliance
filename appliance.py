@@ -864,8 +864,9 @@ def main():
     pe = PacketEngine(ih)
     print("Listening...")
 
-    # Collect all appliance IPs to filter out our own outbound packets
-    own_ips = {ih.mgt.get_ip(), ih.int.get_ip(), ih.dmz.get_ip(), ih.ext.get_ip()}
+    # Collect all appliance IPs to filter out our own outbound packets.
+    # Includes the public PAT IP so re-sniffed outbound NAT packets are ignored.
+    own_ips = {ih.mgt.get_ip(), ih.int.get_ip(), ih.dmz.get_ip(), ih.ext.get_ip(), "130.102.184.1"}
 
     def handle(pkt):
         try:
