@@ -3,7 +3,6 @@ import time
 import sys
 from support import EXT_SRC, EXT_DST, EXT_IFACE, MGT_DST, MGT_IFACE
 
-# ---------------------- Helpers ----------------------
 
 def check(expected):
     answer = input(f"Expected: {expected}\nContinue? (y/n): ")
