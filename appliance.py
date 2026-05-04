@@ -1,7 +1,7 @@
 from __future__ import annotations
 import random
 from scapy.all import sniff, Ether, IP, TCP, UDP, ICMP, Raw, sendp, get_if_hwaddr, get_if_addr
-from support import ip_to_int, int_to_ip
+from support import ip_to_int, int_to_ip, INTERFACE_MAP, IFACE_NAMES, IFACE_NETWORKS
 
 # ###################### Utility ######################
 
@@ -71,30 +71,6 @@ STR_MACS = {
     "int": "8e:e8:02:3a:00:f9",
     "dmz": "46:49:15:3d:47:15",
     "ext": "a6:6a:20:d1:68:d4"
-}
-
-# Map physical interface names to logical interface names
-INTERFACE_MAP = {
-    "enp0s1": "int",   # internal network 
-    "enp0s2": "ext",   # external network 
-    "enp0s3": "dmz",   # DMZ 
-    "enp0s4": "mgt",   # management 
-}
-
-# Reverse map: logical name → physical interface name, used when sending packets
-IFACE_NAMES = {
-    "int": "enp0s1",
-    "ext": "enp0s2",
-    "dmz": "enp0s3",
-    "mgt": "enp0s4",
-}
-
-# Map network addresses to the logical interface that owns that subnet
-IFACE_NETWORKS = {
-    "192.168.58.0": "mgt",
-    "192.168.64.0": "int",
-    "192.168.57.0": "dmz",
-    "192.168.56.0": "ext",
 }
 
 

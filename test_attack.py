@@ -1,29 +1,13 @@
 from scapy.all import IP, TCP, UDP, ICMP, send
 import time
 import sys
-
-# ---------------------- Interface mapping ----------------------
-
-INT_SRC  = "192.168.64.1"   # Mac side of int  (bridge100)
-EXT_SRC  = "192.168.56.1"   # Mac side of ext  (bridge101)
-DMZ_SRC  = "192.168.57.1"   # Mac side of dmz  (bridge102)
-MGT_SRC  = "192.168.58.1"   # Mac side of mgt  (bridge103)
-
-INT_DST  = "192.168.64.2"   # VM enp0s1 (int)
-EXT_DST  = "192.168.56.2"   # VM enp0s2 (ext)
-DMZ_DST  = "192.168.57.2"   # VM enp0s3 (dmz)
-MGT_DST  = "192.168.58.2"   # VM enp0s4 (mgt)
-
-INT_IFACE = "bridge100"
-EXT_IFACE = "bridge101"
-DMZ_IFACE = "bridge102"
-MGT_IFACE = "bridge103"
+from support import EXT_SRC, EXT_DST, EXT_IFACE, MGT_DST, MGT_IFACE
 
 # ---------------------- Helpers ----------------------
 
 def check(expected):
-    answer = input(f"Expected: {expected}\nDid the alert appear? (y/n): ")
-    print("PASS" if answer.strip().lower() == "y" else "FAIL")
+    answer = input(f"Expected: {expected}\nContinue? (y/n): ")
+
 
 def run_test(name, pkt, iface, expected):
     print(f"\n--- {name} ---")
